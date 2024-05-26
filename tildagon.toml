@@ -28,7 +28,7 @@ author = "naomi"
 license = "LGPL-3.0-only"
 
 # URL to the repository of your app.
-url = "https://www.github.com/npentrel/tildagon-demo"
+url = "https://www.github.com/npentrel/tildagon-snake"
 
 # Description of your app.  Maximum 140 characters!
 description = "Play snake on your tildagon badge."
