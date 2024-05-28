@@ -2,7 +2,7 @@ import app
 import asyncio
 import random
 
-from app_components import Notification, clear_background
+from app_components import YesNoDialog, clear_background
 from events.input import Buttons, BUTTON_TYPES
 
 
@@ -17,7 +17,20 @@ class SnakeApp(app.App):
         self.step = 0
         self.score = 0
         self.game = ""
-        self.notification = None
+        self.dialog = None
+
+    def _reset(self):
+        self.snake = [(16,16)]
+        self.food = []
+        self.direction = ""
+        self.score = 0
+        self.dialog = None
+
+    def _exit(self):
+        self._reset()
+        self.button_states.clear()
+        self.minimise()
+
 
     def update(self, delta):
         if self.button_states.get(BUTTON_TYPES["RIGHT"]):
@@ -44,11 +57,14 @@ class SnakeApp(app.App):
                 self.step = 0
                 self._move_snake()
         elif self.game == "OVER":
-            self.notification = Notification("Game Over. Cancel to quit.")
+            self.dialog = YesNoDialog(
+                message="Game Over.\nPlay Again?",
+                on_yes=self._reset,
+                on_no=self._exit,
+                app=self,
+            )
+            # Reset the game variable to ensure this dialog is only created once
             self.game = ""
-
-        if self.notification:
-            self.notification.update(delta)
 
     def _move_snake(self):
         first_x, first_y = self.snake[0]
@@ -112,5 +128,5 @@ class SnakeApp(app.App):
 
         ctx.restore()
 
-        if self.notification:
-            self.notification.draw(ctx)
+        if self.dialog:
+            self.dialog.draw(ctx)
