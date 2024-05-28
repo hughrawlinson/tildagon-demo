@@ -37,4 +37,4 @@ description = "Play snake on your tildagon badge."
 # increased, we interpret this as a new version being released.
 #
 # Version number must be an integer!
-version = "0.0.2"
+version = "0.0.3"
