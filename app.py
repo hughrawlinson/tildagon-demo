@@ -7,7 +7,7 @@ class HelloWorld(App):
   def update(self):
     pass:
 
-  def draw(self):
+  def draw(self, ctx):
     ctx.move_to(0, 0).text("Hello, world!"]
 
 __app_export__ = HelloWorld
