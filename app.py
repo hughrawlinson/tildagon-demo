@@ -1,7 +1,9 @@
 import app
 
 from app_components.tokens import label_font_size
+from app_components.notification import Notification
 from events.input import Buttons, BUTTON_TYPES
+from tildagonos import tildagonos
 
 # Motor Driver
 PWM_FREQ = 5000
@@ -26,6 +28,8 @@ RECEIVE_INSTR = 2
 COUNTDOWN = 3
 RUN = 4
 DONE = 5
+
+MINIMISE_VALID_STATES = [0, 1, 2, 5]
 
 class Instruction:
 
@@ -86,18 +90,20 @@ class BadgeBotApp(app.App):
         self.current_power_duration = ((0,0,0,0), 0)
         self.power_plan_iter = iter([])
 
+        self.notification = None
+
         # Overall app state
         self.current_state = WARNING
 
     def update(self, delta):
-        if self.button_states.get(BUTTON_TYPES["CANCEL"]):
-            # The button_states do not update while you are in the background.
-            # Calling clear() ensures the next time you open the app, it stays open.
-            # Without it the app would close again immediately.
+        if self.notification:
+            self.notification.update(delta)
+
+        if self.button_states.get(BUTTON_TYPES["CANCEL"]) and self.current_state in MINIMISE_VALID_STATES:
             self.button_states.clear()
             self.minimise()
 
-        if self.current_state == MENU:
+        elif self.current_state == MENU:
             # Exit start menu
             if self.button_states.get(BUTTON_TYPES["CONFIRM"]):
                 self.current_state = RECEIVE_INSTR
@@ -110,11 +116,14 @@ class BadgeBotApp(app.App):
                 self.button_states.clear()
 
         elif self.current_state == RECEIVE_INSTR:
+            self.clear_leds()
             # Enable/disable scrolling and check for long press
             if self.button_states.get(BUTTON_TYPES["CONFIRM"]):
 
                 if self.long_press_delta == 0:
+                    # TODO Move to button up event
                     self.is_scroll = not self.is_scroll
+                    self.notification = Notification(f"Scroll {self.is_scroll}")
 
                 self.long_press_delta += delta
                 if self.long_press_delta >= LONG_PRESS_MS:
@@ -147,10 +156,26 @@ class BadgeBotApp(app.App):
                     self._handle_instruction_press(BUTTON_TYPES["DOWN"])
                     self.button_states.clear()
 
+                # LED management
+                if self.last_press == BUTTON_TYPES["RIGHT"]:
+                    tildagonos.leds[2] = (255, 0, 0)
+                    tildagonos.leds[3] = (255, 0, 0)
+                elif self.last_press == BUTTON_TYPES["LEFT"]:
+                    tildagonos.leds[8] = (0, 255, 0)
+                    tildagonos.leds[9] = (0, 255, 0)
+                elif self.last_press == BUTTON_TYPES["UP"]:
+                    tildagonos.leds[12] = (0, 0, 255)
+                    tildagonos.leds[1] = (0, 0, 255)
+                elif self.last_press == BUTTON_TYPES["DOWN"]:
+                    tildagonos.leds[6] = (255, 255, 0)
+                    tildagonos.leds[7] = (255, 255, 0)
+
+            tildagonos.leds.write()
+
         elif self.current_state == COUNTDOWN:
             self.run_countdown_ms += delta
             if self.run_countdown_ms >= self.run_countdown_target_ms:
-                self.power_plan_iter = self.instructions[0].power_plan_iterator # TODO chain all instr
+                self.power_plan_iter = chain(*(instr.power_plan_iterator for instr in self.instructions))
                 self.current_state = RUN
 
         elif self.current_state == RUN:
@@ -220,11 +245,13 @@ class BadgeBotApp(app.App):
             ctx.rgb(1,1,0).move_to(H_START, V_START+VERTICAL_OFFSET).text(str(countdown_val))
         elif self.current_state == RUN:
             ctx.rgb(1,1,1).move_to(H_START, V_START).text("Running power")
-            ctx.rgb(1,0,0).move_to(H_START, V_START + 2*VERTICAL_OFFSET).text(str(self.current_power_duration))
+            ctx.rgb(1,0,0).move_to(H_START-30, V_START + 2*VERTICAL_OFFSET).text(str(self.current_power_duration))
         elif self.current_state == DONE:
             ctx.rgb(1,1,1).move_to(H_START, V_START).text(f"Complete!")
             ctx.rgb(1,1,1).move_to(H_START, V_START + VERTICAL_OFFSET).text("To restart:")
             ctx.rgb(1,1,0).move_to(H_START, V_START + 2*VERTICAL_OFFSET).text("Press C")
+        if self.notification:
+            self.notification.draw(ctx)
         ctx.restore()
 
 
@@ -258,5 +285,13 @@ class BadgeBotApp(app.App):
             if len(self.instructions) >= 5:
                 self.scroll_offset -= 1
             self.current_instruction = None
+
+    def clear_leds(self):
+        for i in range(0,12):
+            tildagonos.leds[i+1] = (0, 0, 0)
+
+def chain(*iterables):
+    for iterable in iterables:
+        yield from iterable
 
 __app_export__ = BadgeBotApp
