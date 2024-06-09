@@ -2,9 +2,11 @@
 # it is copied onto the EEPROM and renamed as app.py
 # It is then run from the EEPROM by the BadgeOS.
 
-import app
 import asyncio
-from machine import (Pin, I2C)
+
+import app
+from machine import I2C, Pin
+
 from tildagon import Pin as ePin
 
 # HexDrive.py App Version - parsed by app.py to check if upgrade is required
@@ -12,7 +14,7 @@ APP_VERSION = 1
 
 POWER_ENABLE_PIN_INDEX = 0	# First LS pin
 
-class HexDrive(app.App):
+class HexDriveApp(app.App):
 
     def __init__(self, config=None):
         self.config = config
@@ -56,4 +58,4 @@ class HexDrive(app.App):
         except:
             print("access to I2C(7) blocked")
 
-__app_export__ = HexDrive
+__app_export__ = HexDriveApp
