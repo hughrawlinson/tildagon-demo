@@ -23,18 +23,14 @@ class HexDrive(app.App):
         HexDrivePowerEnable = self.config.ls_pin[POWER_ENABLE_PIN_INDEX]
         self.set_pin_out(HexDrivePowerEnable.pin)   # Work around as Tildagon(s) (version 1.6) is missing code to set the eGPIO direction to output
         self.set_power(False)
-        # Set all HS pints to low level outputs
+        # Set all HexDrive Hexpansion HS pins to low level outputs
         for hs_pin in self.config.pin:
             hs_pin.value(0)
-
-    # Don't need to do anything in the update loop
-    #def update(self, delta=None):
-    #    self.minimise()
     
     async def background_task(self):
         while 1:
             # we will do something here probably
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(5)
 
     # TODO: how to expose this or register it with the event bus so that it can be called/actioned from the main App?
     def set_power(self, state):

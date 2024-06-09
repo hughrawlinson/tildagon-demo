@@ -4,25 +4,22 @@ from app_components.tokens import label_font_size
 from app_components.notification import Notification
 from events.input import Buttons, BUTTON_TYPES
 from tildagonos import tildagonos
-
 from system.eventbus import eventbus
-from system.patterndisplay.events import PatternDisable, PatternEnable
-
+from system.patterndisplay.events import (PatternDisable, PatternEnable)
 
 # Hexpansion related imports
 from system.hexpansion.header import HexpansionHeader
-from system.hexpansion.util import (
-    read_hexpansion_header,
-    get_hexpansion_block_devices,
-    detect_eeprom_addr,
-)
-from system.hexpansion.events import HexpansionInsertionEvent
+from system.hexpansion.util import (read_hexpansion_header, get_hexpansion_block_devices, detect_eeprom_addr)
+from system.hexpansion.events import (HexpansionInsertionEvent, HexpansionRemovalEvent)
+from system.hexpansion.config import _pin_mapping
+
 import vfs
 import os
 import asyncio
-from system.hexpansion.config import _pin_mapping
 from machine import (Pin, I2C)
 from tildagon import Pin as ePin
+
+CURRENT_APP_VERSION = 1 # Integer Version Number - checked against the EEPROM app.py version to determine if it needs updating
 
 # Motor Driver
 PWM_FREQ = 5000
@@ -41,20 +38,26 @@ USER_TICK_MULTIPLIER = 4
 MAX_POWER = 100
 
 # App states
-INIT = -1
-WARNING = 0
-MENU = 1
-RECEIVE_INSTR = 2
-COUNTDOWN = 3
-RUN = 4
-DONE = 5
-DETECTED = 6        # Hexpansion with EEPROM detected
-PROGRAMMING = 7     # Hexpansion EEPROM programming
+STATE_INIT = -1
+STATE_WARNING = 0
+STATE_MENU = 1
+STATE_RECEIVE_INSTR = 2
+STATE_COUNTDOWN = 3
+STATE_RUN = 4
+STATE_DONE = 5
+STATE_WAIT = 6            # Between Hexpansion initialisation and upgrade steps  
+STATE_DETECTED = 7        # Hexpansion ready for EEPROM initialisation
+STATE_UPGRADE = 8         # Hexpansion ready for EEPROM upgrade
+STATE_PROGRAMMING = 9     # Hexpansion EEPROM programming
+STATE_REMOVED = 10        # Hexpansion removed
+STATE_ERROR = 11          # Hexpansion error
 
-MINIMISE_VALID_STATES = [0, 1, 2, 5]
+MINIMISE_VALID_STATES = [0, 1, 2, 5, 7, 8, 10, 11]
 
-DEFAULT_HEX_DRIVE_SLOT = 2
+DEFAULT_HEX_DRIVE_SLOT = 3
 POWER_ENABLE_PIN_INDEX = 0	# First LS pin
+
+HEXDRIVE_PID = 0xCBCB
 
 class Instruction:
     def __init__(self, press_type: BUTTON_TYPES) -> None:
@@ -116,16 +119,32 @@ class BadgeBotApp(app.App):
 
         self.notification = None
 
-        self.status = "Insert HexDrive in Slot 2 to program"
-        self.programming_port = DEFAULT_HEX_DRIVE_SLOT
+        # Hexpansion related
+        self.hexdrive_has_been_seen = False
         self.ports_with_blank_eeprom = []
         self.ports_with_hexdrive = []
-        eventbus.on_async(
-            HexpansionInsertionEvent, self.handle_hexpansion_insertion, self
-        )
+        self.ports_with_upgraded_hexdrive = []
+        eventbus.on_async(HexpansionInsertionEvent, self.handle_hexpansion_insertion, self)
+        eventbus.on_async(HexpansionRemovalEvent,   self.handle_hexpansion_removal,   self)
 
-        # Overall app state
-        self.current_state = INIT
+        # Overall app state (controls what is displayed)
+        self.current_state = STATE_INIT
+
+    async def handle_hexpansion_removal(self, event):
+        await asyncio.sleep(1)
+        if event.port in self.ports_with_blank_eeprom:
+            print(f"H:EEPROM removed from port {event.port}")
+            self.ports_with_blank_eeprom.remove(event.port)
+        if event.port in self.ports_with_hexdrive:
+            print(f"H:HexDrive removed from port {event.port}")
+            self.ports_with_hexdrive.remove(event.port)
+        if event.port in self.ports_with_upgraded_hexdrive:
+            print(f"H:HexDrive removed from port {event.port}")
+            self.ports_with_upgraded_hexdrive.remove(event.port)
+        if self.current_state == STATE_DETECTED and event.port == self.detected_port:
+            self.current_state = STATE_WAIT
+        if self.current_state == STATE_UPGRADE and event.port == self.upgrade_port:
+            self.current_state = STATE_WAIT
 
     async def handle_hexpansion_insertion(self, event):
         await asyncio.sleep(1)    
@@ -133,84 +152,128 @@ class BadgeBotApp(app.App):
         # Autodetect eeprom addr
         addr = detect_eeprom_addr(i2c)
         if addr is None:
-            print("Scan found no eeproms")
+            print(f"H:Scan found no EEPROMs")
             return
         # Do we have a header?
         header = read_hexpansion_header(i2c, addr)
         if (header is None):
-            print(f"Detected eeprom at {hex(addr)}")
+            print(f"H:Detected EEPROM at {hex(addr)}")
             self.ports_with_blank_eeprom.append(event.port)
-            return
-        elif header.vid == 0xCAFE and header.pid == 0xCBCB:
-            # This is ours
-            print("Found HexDrive on port", event.port)
-            self.current_state = PROGRAMMING
-            self.status = f"Found {header.friendly_name} #{header.unique_id}"
+        elif header.vid == 0xCAFE and header.pid == HEXDRIVE_PID:
+            # We have a HexDrive Hexpansion
+            print(f"H:Found {header.friendly_name} #{header.unique_id}")
             if event.port not in self.ports_with_hexdrive:
                 self.ports_with_hexdrive.append(event.port)
-            await asyncio.sleep(0.5)          
-            # Try creating block devices, one for the whole eeprom,
-            # one for the partition with the filesystem on it
+
+
+    def get_app_version_in_eeprom(self, port, header, i2c, addr):
+        try:
+            eep, partition = get_hexpansion_block_devices(i2c, header, addr)
+        except RuntimeError as e:
+            print(f"H:Error getting block devices: {e}")
+            return 0
+        version = 0
+        mountpoint = '/hexpansion_' + str(port)
+        already_mounted = False # if there is a way to find out if it is already mounted then use it here
+        if not already_mounted:
+            print(f"H:Mounting {partition} at {mountpoint}")
             try:
-                eep, partition = get_hexpansion_block_devices(i2c, header, addr)
-            except RuntimeError as e:
-                return
-            # TODO CHECK IF UPDATE IS REQUIRED            
-            mountpoint = '/fixinghexdrive'
-            vfs.mount(partition, mountpoint, readonly=False)
+                vfs.mount(partition, mountpoint, readonly=True)
+            except Exception as e:
+                #if e.args[0] == 1:
+                already_mounted = True
+                #else:
+                print(f"H:Error mounting: {e}")
+        print("H:Reading app.py")
+        try:
+            with open(f"{mountpoint}/app.py", "rt") as appfile:
+                app = appfile.read()
+                version = app.split("APP_VERSION = ")[1].split("\n")[0]
+            if not already_mounted:
+                print(f"H:Unmounting {mountpoint}")                    
+                vfs.umount(mountpoint)
+            print(f"H:HexDrive app.py version is {version}")
+            return int(version)
+        except Exception as e:
+            print(f"H:Error reading HexDrive app.py: {e}")
+            return 0
+
+    def update_app_in_eeprom(self, port, header, i2c, addr):
+        # Copy hexdreive.py to EEPROM as app.py
+        print(f"H:Updating HexDrive app.py on port {port}")
+        try:
+            eep, partition = get_hexpansion_block_devices(i2c, header, addr)
+        except RuntimeError as e:
+            print(f"H:Error getting block devices: {e}")
+            return False              
+        mountpoint = '/hexpansion_' + str(port)
+        already_mounted = False
+        if not already_mounted:
+            print(f"H:Mounting {partition} at {mountpoint}")
+            try:
+                vfs.mount(partition, mountpoint, readonly=False)
+            except Exception as e:
+                if e.args[0] == 1:
+                    already_mounted = True
+                else:
+                    print(f"H:Error mounting: {e}")
+        try:
             print(os.listdir(mountpoint))
-            self.status = "Mounted filesystem"
-            await asyncio.sleep(0.5)
-            print("1")
             path = "/" + __file__.rsplit("/", 1)[0] + "/hexdrive.py"
-            print("2")
+            print(f"H:Copying {path} to {mountpoint}/app.py")
             with open(f"{mountpoint}/app.py", "wt") as appfile:
-                print("3")
                 with open(path, "rt") as template:
-                    print("4")
                     appfile.write(template.read())
-            self.status = "Updated application"
-            vfs.umount(mountpoint)
-            await asyncio.sleep(3)
-            self.status = ""
-            self.current_state = MENU
-            #self.minimise()
+            if not already_mounted:
+                print(f"H:Unmounting {mountpoint}")                    
+                vfs.umount(mountpoint)
+            print(f"H:HexDrive app.py updated to version {CURRENT_APP_VERSION}")
+            return True
+        except Exception as e:
+            print(f"H:Error updating HexDrive app.py: {e}")
+            return False   
 
     def prepare_eeprom(self, port, i2c, addr):
-        # Fill in your desired header info here:
-        self.status = "EEPROM initialising..."
-        print("Initialising EEPROM @", hex(addr), "on port", port)
-        # TODO read EEPROM size and set page size accordingly
+        print(f"H:Initialising EEPROM @ {hex(addr)} on port {port}")
         header = HexpansionHeader(
             manifest_version="2024",
             fs_offset=32,
             eeprom_page_size=32,
-            eeprom_total_size=64 * 1024 // 8,  # only claim to be 512kbit which is 64kbyte and hence does not use A16.
+            eeprom_total_size=64 * 1024 // 8,
             vid=0xCAFE,
-            pid=0xCBCB,
+            pid=HEXDRIVE_PID,
             unique_id=0x0,
             friendly_name="HexDrive",
         )
-
-        # Determine amount of bytes in internal address
-        addr_len = 2 if header.eeprom_total_size > 256 else 1
-        print(f"Using {addr_len} bytes for eeprom internal address")
         # Write and read back header
         # write_header is broken for our type of EEPROM so we do it manually
         #write_header(port, header, addr=addr, addr_len=addr_len, page_size=header.eeprom_page_size)
         i2c.writeto(addr, bytes([0, 0]) + header.to_bytes())
-        header = read_hexpansion_header(i2c, addr, set_read_addr=True, addr_len=addr_len)
+        header = read_hexpansion_header(i2c, addr, set_read_addr=True, addr_len=2)
         if header is None:
-            self.status = "EEPROM Init Failed"
-            raise RuntimeError("EEPROM Init failed")
-        # Get block devices
-        eep, partition = get_hexpansion_block_devices(i2c, header, addr)
-        # Format
-        vfs.VfsLfs2.mkfs(partition)
-        # And mount!
-        vfs.mount(partition, "/eeprom")
-        print("EEPROM initialised")
-        self.status = "EEPROM initialised"
+            raise RuntimeError("H:EEPROM Init failed")
+            return False
+        try:
+            # Get block devices
+            eep, partition = get_hexpansion_block_devices(i2c, header, addr)
+        except RuntimeError as e:
+            print(f"H:Error getting block devices: {e}")
+            return False           
+        try:
+            # Format
+            vfs.VfsLfs2.mkfs(partition)
+            print(f"H:EEPROM formatted")
+        except Exception as e:
+            print(f"H:Error formatting: {e}")
+            return False
+        try:
+            # And mount!
+            vfs.mount(partition, "/eeprom")
+            print(f"H:EEPROM initialised")
+        except Exception as e:
+            print(f"H:Error mounting: {e}")
+            return False
+        return True 
 
     def set_pin_out(self, pin):
         # Tildagon(s) (version 1.6) is missing code to set the eGPIO direction to output
@@ -224,7 +287,15 @@ class BadgeBotApp(app.App):
             config_reg &= ~(pin[2])
             i2c.writeto_mem(pin[0], 0x04+pin[1], bytes([config_reg]))
         except:
-            print("access to I2C(7) blocked")
+            print(f"H:access to I2C(7) blocked")
+
+    def set_hexdrive_power(self, state):
+        port = self.ports_with_upgraded_hexdrive[0]
+        power_enable_pin_number = _pin_mapping[port]["ls"][POWER_ENABLE_PIN_INDEX]
+        HexDrivePowerEnable = ePin(power_enable_pin_number,Pin.OUT)
+        #Issue that the Badge Code does not set the IO expander to output mode
+        self.set_pin_out(HexDrivePowerEnable.pin)
+        HexDrivePowerEnable.value(state)
 
     # Scan the Hexpansion ports for EEPROMs and HexDrives in case they are already plugged in when we start
     def scan_ports(self):
@@ -234,74 +305,127 @@ class BadgeBotApp(app.App):
             if addr is not None:
                 header = read_hexpansion_header(i2c, addr)
                 if header is None:
-                    print("Found EEPROM on port", port, "at", hex(addr))
+                    print(f"H:Found EEPROM on port {port}")
                     self.ports_with_blank_eeprom.append(port)
                 elif header.vid == 0xCAFE and header.pid == 0xCBCB:
-                    print("Found HexDrive on port", port)
+                    print(f"H:Found HexDrive on port {port}")
                     self.ports_with_hexdrive.append(port)
 
     def update(self, delta):
         if self.notification:
             self.notification.update(delta)
 
-        if self.current_state == INIT:
+        if self.current_state == STATE_INIT:
+            # One Time initialisation
             self.scan_ports()
-            if len(self.ports_with_hexdrive) == 0:
-                # There are currently no HexDrives plugged in
-                if len(self.ports_with_blank_eeprom) == 0:
-                    self.current_state = WARNING
-                else:    
-                    self.current_state = DETECTED
+            if (len(self.ports_with_hexdrive) == 0) and (len(self.ports_with_blank_eeprom) == 0):
+                # There are currently no possible HexDrives plugged in
+                self.current_state = STATE_WARNING
+        
+        if self.current_state == STATE_ERROR:
+            if self.button_states.get(BUTTON_TYPES["CONFIRM"]) or self.button_states.get(BUTTON_TYPES["CANCEL"]):
+                self.button_states.clear()
+                self.current_state = STATE_WAIT
+                self.error_message = []
+        elif 0 < len(self.ports_with_blank_eeprom):
+            # if there are any ports with blank eeproms
+            if self.current_state == STATE_DETECTED:
+                if self.button_states.get(BUTTON_TYPES["CONFIRM"]):
+                    self.button_states.clear()
+                    # EEPROM initialisation        
+                    port = self.ports_with_blank_eeprom.pop(0)
+                    self.current_state = STATE_PROGRAMMING
+                    if self.prepare_eeprom(port, I2C(port), 0x50):
+                        self.ports_with_hexdrive.append(port)
+                        self.current_state = STATE_WAIT
+                    else:
+                        self.error_message = ["EEPROM","Initialisation","Failed"]
+                        self.current_state = STATE_ERROR          
+                elif self.button_states.get(BUTTON_TYPES["CANCEL"]):
+                    print(f"H:Cancelled")
+                    self.button_states.clear()
+                    self.ports_with_blank_eeprom.pop(0)
+                    self.current_state = STATE_WAIT
+                return
             else:
-                self.current_state = MENU
-            return    
-        # EEPROM initialisation
-        # if there are any ports with blank eeproms, initialise them
-        if 0 < len(self.ports_with_blank_eeprom):
-            # only initialise if in specific port for which button has been pressed TODO
-            port = self.ports_with_blank_eeprom.pop(0)
-            if (self.programming_port == port):
-                # Only initialise the EEPROM on the selected port if it is the specified port
-                i2c = I2C(port)
-                # Autodetect eeprom addr
-                addr = 0x50 # detect_eeprom_addr(i2c)
-                if addr is not None:
-                    # Do we have a header?
-                    header = None # read_hexpansion_header(i2c, addr)
-                    if (header is None):
-                        self.current_state = PROGRAMMING
-                        self.prepare_eeprom(port, i2c, addr)
-                        # How to now trigger EEPROM to be programmed?
-                        self.current_state = MENU
-        if self.button_states.get(BUTTON_TYPES["UP"]):
-                # Test Use - enable Hexpansion Power
-                print("Enable HexDrive Power")
-                power_enable_pin_number = _pin_mapping[self.port]["ls"][POWER_ENABLE_PIN_INDEX]
-                HexDrivePowerEnable = ePin(power_enable_pin_number,Pin.OUT)
-                # Issue that the Badge Code does not set the IO expander to output mode
-                self.set_pin_out(HexDrivePowerEnable.pin)
-                HexDrivePowerEnable.value(1)
-        if self.button_states.get(BUTTON_TYPES["DOWN"]):
-                # Test Use - disable Hexpansion Power
-                print("Disable HexDrive Power")
-                power_enable_pin_number = _pin_mapping[self.port]["ls"][POWER_ENABLE_PIN_INDEX]
-                HexDrivePowerEnable = ePin(power_enable_pin_number,Pin.OUT)
-                HexDrivePowerEnable.value(0)                
+                # Show the UI prompt and wait for button press
+                self.detected_port = self.ports_with_blank_eeprom[0]
+                self.current_state = STATE_DETECTED          
+        elif 0 < len(self.ports_with_hexdrive):
+            # if there are any ports with HexDrives
+            if self.current_state == STATE_UPGRADE:
+                if self.button_states.get(BUTTON_TYPES["CONFIRM"]):
+                    self.button_states.clear()
+                    # EEPROM programming with latest App.py                
+                    self.current_state = STATE_PROGRAMMING
+                    port = self.ports_with_hexdrive.pop(0)
+                    i2c = I2C(port)
+                    header = read_hexpansion_header(i2c, 0x50)
+                    if header:
+                        if self.update_app_in_eeprom(port, header, i2c, 0x50):
+                            self.ports_with_upgraded_hexdrive.append(port)
+                            self.current_state = STATE_WAIT
+                        else:
+                            self.error_message = ["HexDrive","Programming","Failed"]
+                            self.current_state = STATE_ERROR
+                    else:
+                        self.error_message = ["HexDrive","Read","Failed"]
+                        self.current_state = STATE_ERROR
+                elif self.button_states.get(BUTTON_TYPES["CANCEL"]):
+                    print(f"H:Cancelled")
+                    self.button_states.clear()
+                    self.ports_with_hexdrive.pop(0)
+                    self.current_state = STATE_WAIT
+                return
+            else:
+                i2c = I2C(self.ports_with_hexdrive[0])
+                header = read_hexpansion_header(i2c, 0x50)
+                if header and header.vid == 0xCAFE and header.pid == HEXDRIVE_PID:
+                    print(f"H:HexDrive on port {self.ports_with_hexdrive[0]}")
+                    if self.get_app_version_in_eeprom(self.ports_with_hexdrive[0], header, i2c, 0x50) == CURRENT_APP_VERSION:
+                        print(f"H:HexDrive on port {self.ports_with_hexdrive[0]} has latest App")
+                        port = self.ports_with_hexdrive.pop(0)
+                        self.ports_with_upgraded_hexdrive.append(port)
+                        self.current_state = STATE_WAIT
+                    else:    
+                        self.current_state = STATE_UPGRADE
+                        # Show the UI prompt and wait for button press
+                        self.upgrade_port = self.ports_with_hexdrive[0]
+                        self.current_state = STATE_UPGRADE
+                else:
+                    print(f"H:Error reading Hexpansion header")
+                    self.error_message = ["Hexpansion","Read","Failed"]
+                    self.current_state = STATE_ERROR        
+        elif self.current_state == STATE_WAIT: 
+            if 0 < len(self.ports_with_upgraded_hexdrive):
+                # We have at least one HexDrive with the latest App.py
+                self.hexdrive_has_been_seen = True
+                self.current_state = STATE_MENU
+            elif self.hexdrive_has_been_seen:
+                self.current_state = STATE_REMOVED
+            else:                   
+                self.current_state = STATE_WARNING
+
+
+
+
+
+
         if self.button_states.get(BUTTON_TYPES["CANCEL"]) and self.current_state in MINIMISE_VALID_STATES:
             self.button_states.clear()
             eventbus.emit(PatternEnable()) # TODO replace with on lose focus on gain focus
             self.minimise()
-        elif self.current_state == MENU:
+        elif self.current_state == STATE_MENU:
             # Exit start menu
             if self.button_states.get(BUTTON_TYPES["CONFIRM"]):
-                self.current_state = RECEIVE_INSTR
+                self.current_state = STATE_RECEIVE_INSTR
                 self.button_states.clear()
-        elif self.current_state == WARNING:
+        elif self.current_state == STATE_WARNING:
             # Exit warning screen
             if self.button_states.get(BUTTON_TYPES["CONFIRM"]):
-                self.current_state = MENU
+                self.current_state = STATE_MENU
                 self.button_states.clear()
-        elif self.current_state == RECEIVE_INSTR:
+        elif self.current_state == STATE_RECEIVE_INSTR:
             eventbus.emit(PatternDisable())
             self.clear_leds()
             # Enable/disable scrolling and check for long press
@@ -313,7 +437,7 @@ class BadgeBotApp(app.App):
                 self.long_press_delta += delta
                 if self.long_press_delta >= LONG_PRESS_MS:
                     self.finalize_instruction()
-                    self.current_state = COUNTDOWN
+                    self.current_state = STATE_COUNTDOWN
             else:
                 # Confirm is not pressed. Reset long_press state
                 self.long_press_delta = 0
@@ -352,20 +476,22 @@ class BadgeBotApp(app.App):
                     tildagonos.leds[7] = (255, 255, 0)
             tildagonos.leds.write()
 
-        elif self.current_state == COUNTDOWN:
+        elif self.current_state == STATE_COUNTDOWN:
             self.run_countdown_ms += delta
             if self.run_countdown_ms >= self.run_countdown_target_ms:
                 self.power_plan_iter = chain(*(instr.power_plan_iterator for instr in self.instructions))
-                self.current_state = RUN
+                self.set_hexdrive_power(True)
+                self.current_state = STATE_RUN
 
-        elif self.current_state == RUN:
+        elif self.current_state == STATE_RUN:
             print(delta)
             power = self.get_current_power_level(delta)
             if power is None:
-                self.current_state = DONE
+                self.current_state = STATE_DONE
             print(f"Using power: {power}")
 
-        elif self.current_state == DONE:
+        elif self.current_state == STATE_DONE:
+            self.set_hexdrive_power(False)
             eventbus.emit(PatternEnable())
             if self.button_states.get(BUTTON_TYPES["CONFIRM"]):
                 self.reset()
@@ -379,7 +505,7 @@ class BadgeBotApp(app.App):
         self.last_press = press_type
 
     def reset(self):
-        self.current_state = MENU
+        self.current_state = STATE_MENU
         self.button_states.clear()
         self.last_press: BUTTON_TYPES = BUTTON_TYPES["CANCEL"]
         self.long_press_delta = 0
@@ -406,37 +532,52 @@ class BadgeBotApp(app.App):
         else:
             ctx.rgb(0,0,0.1).rectangle(-120,-120,240,240).fill()
 
-        if self.current_state == WARNING:
-            ctx.rgb(1,1,1).move_to(H_START, V_START + 0*VERTICAL_OFFSET + 20).text("Please buy")
-            ctx.rgb(1,1,0).move_to(H_START, V_START + 1*VERTICAL_OFFSET + 20).text("HexDrive")
-            ctx.rgb(1,1,1).move_to(H_START, V_START + 2*VERTICAL_OFFSET + 20).text("Hexpansion")
-            ctx.rgb(1,1,1).move_to(H_START, V_START + 3*VERTICAL_OFFSET + 20).text("from")
-            ctx.rgb(1,1,0).move_to(H_START, V_START + 4*VERTICAL_OFFSET + 20).text("RobotMad")
-        elif self.current_state == DETECTED:  
-            ctx.rgb(1,1,1).move_to(H_START, V_START + 0*VERTICAL_OFFSET + 20).text("Hexpansion")
-            ctx.rgb(1,1,0).move_to(H_START, V_START + 1*VERTICAL_OFFSET + 20).text("Detected")
-            ctx.rgb(1,1,1).move_to(H_START, V_START + 2*VERTICAL_OFFSET + 20).text("Program EEPROM")
-            ctx.rgb(1,1,1).move_to(H_START, V_START + 3*VERTICAL_OFFSET + 20).text("with HexDrive?")
-            #TODO button to confirm - with timeout
-        elif self.current_state == PROGRAMMING:
-            ctx.text_align = ctx.CENTER
-            ctx.rgb(1, 1, 1).move_to(0,0).text(self.status)
-        elif self.current_state == MENU:
-            ctx.rgb(1,1,1).move_to(H_START, V_START).text("To Program:")
-            ctx.rgb(1,1,0).move_to(H_START, V_START + VERTICAL_OFFSET).text("Press C")
-            ctx.rgb(1,1,1).move_to(H_START, V_START + 2*VERTICAL_OFFSET + 10).text("When finished:")
-            ctx.rgb(1,1,0).move_to(H_START, V_START + 3*VERTICAL_OFFSET + 10).text("Long press C")
-        elif self.current_state == RECEIVE_INSTR:
+        if self.current_state == STATE_WARNING:
+            ctx.rgb(1,1,1).move_to(H_START, V_START + 0*VERTICAL_OFFSET + 20).text(f"Please buy")
+            ctx.rgb(1,1,0).move_to(H_START, V_START + 1*VERTICAL_OFFSET + 20).text(f"HexDrive")
+            ctx.rgb(1,1,1).move_to(H_START, V_START + 2*VERTICAL_OFFSET + 20).text(f"Hexpansion")
+            ctx.rgb(1,1,1).move_to(H_START, V_START + 3*VERTICAL_OFFSET + 20).text(f"from")
+            ctx.rgb(1,1,0).move_to(H_START, V_START + 4*VERTICAL_OFFSET + 20).text(f"RobotMad")
+        elif self.current_state == STATE_REMOVED:
+            ctx.rgb(1,1,0).move_to(H_START, V_START + 0*VERTICAL_OFFSET + 20).text(f"HexDrive")
+            ctx.rgb(1,1,1).move_to(H_START, V_START + 1*VERTICAL_OFFSET + 20).text(f"removed")
+            ctx.rgb(1,1,1).move_to(H_START, V_START + 2*VERTICAL_OFFSET + 20).text(f"Please reinsert")            
+        elif self.current_state == STATE_DETECTED:  
+            ctx.rgb(1,1,1).move_to(H_START, V_START + 0*VERTICAL_OFFSET + 20).text(f"Hexpansion")
+            ctx.rgb(1,1,1).move_to(H_START, V_START + 1*VERTICAL_OFFSET + 20).text(f"Detected in")
+            ctx.rgb(1,1,0).move_to(H_START, V_START + 2*VERTICAL_OFFSET + 20).text(f"Slot {self.detected_port}")
+            ctx.rgb(1,1,1).move_to(H_START, V_START + 3*VERTICAL_OFFSET + 20).text(f"Initialise EEPROM")
+            ctx.rgb(1,1,1).move_to(H_START, V_START + 4*VERTICAL_OFFSET + 20).text(f"as HexDrive?")
+        elif self.current_state == STATE_UPGRADE:  
+            ctx.rgb(1,1,0).move_to(H_START, V_START + 0*VERTICAL_OFFSET + 20).text(f"HexDrive")
+            ctx.rgb(1,1,1).move_to(H_START, V_START + 1*VERTICAL_OFFSET + 20).text(f"Detected in")
+            ctx.rgb(1,1,0).move_to(H_START, V_START + 2*VERTICAL_OFFSET + 20).text(f"Slot {self.upgrade_port}")
+            ctx.rgb(1,1,1).move_to(H_START, V_START + 3*VERTICAL_OFFSET + 20).text(f"Program EEPROM")
+            ctx.rgb(1,1,1).move_to(H_START, V_START + 4*VERTICAL_OFFSET + 20).text(f"with App?")            
+        elif self.current_state == STATE_PROGRAMMING:
+            ctx.rgb(1,1,0).move_to(H_START, V_START + 0*VERTICAL_OFFSET + 20).text(f"HexDrive")
+            ctx.rgb(1,1,1).move_to(H_START, V_START + 1*VERTICAL_OFFSET + 20).text(f"Programming")
+            ctx.rgb(1,1,1).move_to(H_START, V_START + 2*VERTICAL_OFFSET + 20).text(f"EEPROM")
+            ctx.rgb(1,1,1).move_to(H_START, V_START + 3*VERTICAL_OFFSET + 20).text(f"...")             
+        elif self.current_state == STATE_MENU:
+            ctx.rgb(1,1,1).move_to(H_START, V_START + 0*VERTICAL_OFFSET + 00).text(f"To Program:")
+            ctx.rgb(1,1,0).move_to(H_START, V_START + 1*VERTICAL_OFFSET + 00).text(f"Press C")
+            ctx.rgb(1,1,1).move_to(H_START, V_START + 2*VERTICAL_OFFSET + 10).text(f"When finished:")
+            ctx.rgb(1,1,0).move_to(H_START, V_START + 3*VERTICAL_OFFSET + 10).text(f"Long press C")
+        elif self.current_state == STATE_ERROR:
+            for i_num, instr in enumerate(self.error_message):
+                ctx.rgb(1,0,0).move_to(H_START, V_START + VERTICAL_OFFSET * i_num).text(str(instr))
+        elif self.current_state == STATE_RECEIVE_INSTR:
             for i_num, instr in enumerate(["START"] + self.instructions + [self.current_instruction, "END"]):
                 ctx.rgb(1,1,0).move_to(H_START, V_START + VERTICAL_OFFSET * (self.scroll_offset + i_num)).text(str(instr))
-        elif self.current_state == COUNTDOWN:
+        elif self.current_state == STATE_COUNTDOWN:
             ctx.rgb(1,1,1).move_to(H_START, V_START).text("Running in:")
             countdown_val = (self.run_countdown_target_ms - self.run_countdown_ms) / 1000
             ctx.rgb(1,1,0).move_to(H_START, V_START+VERTICAL_OFFSET).text(str(countdown_val))
-        elif self.current_state == RUN:
+        elif self.current_state == STATE_RUN:
             ctx.rgb(1,1,1).move_to(H_START, V_START).text("Running power")
             ctx.rgb(1,0,0).move_to(H_START-30, V_START + 2*VERTICAL_OFFSET).text(str(self.current_power_duration))
-        elif self.current_state == DONE:
+        elif self.current_state == STATE_DONE:
             ctx.rgb(1,1,1).move_to(H_START, V_START).text(f"Complete!")
             ctx.rgb(1,1,1).move_to(H_START, V_START + VERTICAL_OFFSET).text("To restart:")
             ctx.rgb(1,1,0).move_to(H_START, V_START + 2*VERTICAL_OFFSET).text("Press C")
