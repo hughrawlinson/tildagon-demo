@@ -1,3 +1,6 @@
+import asyncio
+import time
+
 import vfs
 from app_components.notification import Notification
 from app_components.tokens import label_font_size
@@ -10,6 +13,8 @@ from system.hexpansion.header import HexpansionHeader
 from system.hexpansion.util import get_hexpansion_block_devices
 from system.patterndisplay.events import PatternDisable, PatternEnable
 from system.scheduler import scheduler
+from system.scheduler.events import (RequestForegroundPopEvent,
+                                     RequestForegroundPushEvent)
 from tildagonos import tildagonos
 
 import app
@@ -85,15 +90,22 @@ class BadgeBotApp(app.App):
         self.ports_with_blank_eeprom = set()
         self.ports_with_hexdrive = set()
         self.ports_with_upgraded_hexdrive = set()
-        eventbus.on_async(HexpansionInsertionEvent, self.handle_hexpansion_insertion, self)
-        eventbus.on_async(HexpansionRemovalEvent,   self.handle_hexpansion_removal,   self)
-
         self.hexdrive_app = None
-    
+        eventbus.on_async(HexpansionInsertionEvent, self.handle_hexpansion_insertion, self)
+        eventbus.on_async(HexpansionRemovalEvent, self.handle_hexpansion_removal, self)
+
         # Overall app state (controls what is displayed and what user inputs are accepted)
         self.current_state = STATE_INIT
 
-    async def handle_hexpansion_removal(self, event):
+        eventbus.on_async(RequestForegroundPushEvent, self.gain_focus, self)
+        eventbus.on_async(RequestForegroundPopEvent, self.lose_focus, self)
+
+        # We start with focus on launch, without an event emmited
+        self.gain_focus(RequestForegroundPushEvent(self))
+   
+    ### ASYNC EVENT HANDLERS ###
+
+    async def handle_hexpansion_removal(self, event: HexpansionRemovalEvent):
         #await asyncio.sleep(1)
         if event.port in self.ports_with_blank_eeprom:
             print(f"H:EEPROM removed from port {event.port}")
@@ -109,10 +121,39 @@ class BadgeBotApp(app.App):
         if self.current_state == STATE_UPGRADE and event.port == self.upgrade_port:
             self.current_state = STATE_WAIT
 
-    async def handle_hexpansion_insertion(self, event):
+    async def handle_hexpansion_insertion(self, event: HexpansionInsertionEvent):
         #await asyncio.sleep(1)
         self.check_port_for_hexdrive(event.port)
-    
+
+    async def gain_focus(self, event: RequestForegroundPushEvent):
+        if event.app is self:
+            eventbus.emit(PatternDisable())
+            self.clear_leds()
+
+    async def lose_focus(self, event: RequestForegroundPopEvent):
+        if event.app is self:
+            eventbus.emit(PatternEnable())
+
+    async def background_task(self):
+        # Modiifed background task loop for shorter sleep time
+        last_time = time.ticks_ms()
+        while True:
+            cur_time = time.ticks_ms()
+            delta_ticks = time.ticks_diff(cur_time, last_time)
+            self.background_update(delta_ticks)
+             # If we want to be kind we could make this variable depending on app state
+             # I.e on transition into run set this lower
+            await asyncio.sleep(0.01)
+            last_time = cur_time
+
+    def background_update(self, delta):
+        if self.current_state == STATE_RUN:
+            power = self.get_current_power_level(delta)
+            if power is None:
+                self.current_state = STATE_DONE
+            else:
+                self.hexdrive_app.set_pwm(power)
+
     def check_port_for_hexdrive(self, port):
         # avoiding use of read_hexpansion_header as this triggers a full i2c scan each time
         # we know the EEPROM address so we can just read the header directly
@@ -403,12 +444,10 @@ class BadgeBotApp(app.App):
 
         if self.button_states.get(BUTTON_TYPES["CANCEL"]) and self.current_state in MINIMISE_VALID_STATES:
             self.button_states.clear()
-            eventbus.emit(PatternEnable()) # TODO replace with on lose focus on gain focus
             self.minimise()
         elif self.current_state == STATE_MENU:
             # Exit start menu
             if self.button_states.get(BUTTON_TYPES["CONFIRM"]):
-                eventbus.emit(PatternDisable())
                 self.current_state = STATE_RECEIVE_INSTR
                 self.button_states.clear()
         elif self.current_state == STATE_WARNING:
@@ -417,7 +456,6 @@ class BadgeBotApp(app.App):
                 self.current_state = STATE_MENU
                 self.button_states.clear()
         elif self.current_state == STATE_RECEIVE_INSTR:
-            self.clear_leds()
             # Enable/disable scrolling and check for long press
             if self.button_states.get(BUTTON_TYPES["CONFIRM"]):
                 if self.long_press_delta == 0:
@@ -474,15 +512,8 @@ class BadgeBotApp(app.App):
                 self.current_state = STATE_RUN
 
         elif self.current_state == STATE_RUN:
-            print(delta)
-            power = self.get_current_power_level(delta)
-            if power is None:
-                eventbus.emit(PatternEnable())
-                self.current_state = STATE_DONE
-            else:
-                print(f"Using power: {power}")
-                self.hexdrive_app.set_pwm(power)
-
+            # Run is primarily managed in the background update
+            pass
                 
         elif self.current_state == STATE_DONE:
             if self.button_states.get(BUTTON_TYPES["CONFIRM"]):
