@@ -8,6 +8,7 @@ sys.path.append("../../../")
 import sim.run
 from system.hexpansion.config import HexpansionConfig
 
+
 def test_import_badgebot_app_and_app_export():
     import sim.apps.BadgeBot.app as BadgeBot
     from sim.apps.BadgeBot import BadgeBotApp
@@ -30,3 +31,8 @@ def test_hexdrive_app_init(port):
 @pytest.fixture
 def port():
     return 1
+
+def test_app_versions_match():
+    import sim.apps.BadgeBot.app as BadgeBot
+    import sim.apps.BadgeBot.hexdrive as HexDrive
+    assert BadgeBot.CURRENT_APP_VERSION == HexDrive.APP_VERSION
