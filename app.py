@@ -734,17 +734,25 @@ class Instruction:
         
     def make_power_plan(self):
         # return collection of tuples of power and their duration
-        ramp_up = [(self.directional_power_tuple(p), TICK_MS)
-                   for p in range(0, MAX_POWER, POWER_STEP_PER_TICK)]
-        print(f"Ramp up:")
-        print(ramp_up)
+        curr_power = 0
+        ramp_up = []
+        for i in range(self._duration):
+            ramp_up.append(self.directional_power_tuple(curr_power), TICK_MS)
+            curr_power += POWER_STEP_PER_TICK
+            if curr_power >= MAX_POWER:
+                ramp_up.append(self.directional_power_tuple(MAX_POWER), TICK_MS)
+                break
+        
+        user_power_duration = self.directional_duration() * (self._duration-(i+1))
+        
+        print(f"Ramp up: {ramp_up}")
         power_durations = ramp_up.copy()
-        user_power_duration = self.directional_duration() * (self._duration-1)
-        power_durations.append((self.directional_power_tuple(MAX_POWER), user_power_duration))
+        if user_power_duration > 0:
+            power_durations.append((self.directional_power_tuple(MAX_POWER), user_power_duration))
         ramp_down = ramp_up.copy()
         ramp_down.reverse()
         power_durations.extend(ramp_down)
-        print(f"Power durations:")
+        print("Power durations:")
         print(power_durations)
         self.power_plan_iterator = iter(power_durations)
 
