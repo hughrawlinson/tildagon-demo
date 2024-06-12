@@ -1,6 +1,6 @@
 import asyncio
 import time
-
+import os
 import vfs
 from app_components.notification import Notification
 from app_components.tokens import label_font_size
@@ -20,7 +20,7 @@ from tildagonos import tildagonos
 
 import app
 
-CURRENT_APP_VERSION = 2 # Integer Version Number - checked against the EEPROM app.py version to determine if it needs updating
+CURRENT_APP_VERSION = 2555 # Integer Version Number - checked against the EEPROM app.py version to determine if it needs updating
 
 # Motor Driver
 MAX_POWER = 65535
@@ -34,6 +34,7 @@ V_START = -58
 # Timings
 TICK_MS = 20 # Smallest unit of change for power, in ms
 USER_DRIVE_MS = 100 # User specifed drive durations, in ms
+USER_TURN_MS  = 20 # User specifed turn durations, in ms
 LONG_PRESS_MS = 750 # Time for long button press to register, in ms
 RUN_COUNTDOWN_MS = 3000 # Time after running program until drive starts, in ms
 
@@ -196,33 +197,48 @@ class BadgeBotApp(app.App):
         try:
             vfs.mount(partition, mountpoint, readonly=True)
             print(f"H:Mounted {partition} at {mountpoint}")
-        except Exception as e:
+        except OSError as e:
             if e.args[0] == 1:
                 already_mounted = True
             else:
                 print(f"H:Error mounting: {e}")
-        print("H:Reading app.py")
-        try:
-            with open(f"{mountpoint}/app.py", "rt") as appfile:
-                app = appfile.read()
-                version = app.split("APP_VERSION = ")[1].split("\n")[0]
-                #matching = re.match(".*^app_version = (\d*).*", app, flags=re.MULTILINE+re.DOTALL)
-                #if matching:
-                #    version = int(matching.group(1))
-            if not already_mounted:
-                print(f"H:Unmounting {mountpoint}")                    
-                vfs.umount(mountpoint)
-            print(f"H:HexDrive app.py version is {version}")
-            return int(version)
         except Exception as e:
-            print(f"H:Error reading HexDrive app.py: {e}")
-            return 0
+            print(f"H:Error mounting: {e}")
+        print("H:Reading app.mpy")
+        try:
+            appfile = open(f"{mountpoint}/app.mpy", "rb")
+            app = appfile.read()
+            appfile.close()
+        except OSError as e:
+            if e.args[0] == 2:
+                # file does not exist is not an error
+                print(f"H:No app.mpy found")
+            else:    
+                print(f"H:Error reading HexDrive app.mpy: {e}")
+        except Exception as e:
+            print(f"H:Error reading HexDrive app.mpy: {e}")            
+        try:
+            #version = app.split("APP_VERSION = ")[1].split("\n")[0]
+            # TODO - means of identifying the version number in the app.mpy file 
+            # quick hack - lets use the length of the file as a version number
+            version = len(app)
+        except Exception as e:
+            version = 0
+            pass                 
+        if not already_mounted:
+            print(f"H:Unmounting {mountpoint}")                    
+            try:
+                vfs.umount(mountpoint)
+            except Exception as e:
+                print(f"H:Error unmounting {mountpoint}: {e}")
+        print(f"H:HexDrive app.mpy version:{version}")
+        return int(version)
 
     def update_app_in_eeprom(self, port, header, i2c, addr) -> bool:
-        # Copy hexdreive.py to EEPROM as app.py
-        print(f"H:Updating HexDrive app.py on port {port}")
+        # Copy hexdreive.py to EEPROM as app.mpy
+        print(f"H:Updating HexDrive app.mpy on port {port}")
         try:
-            eep, partition = get_hexpansion_block_devices(i2c, header, addr)
+            _, partition = get_hexpansion_block_devices(i2c, header, addr)
         except RuntimeError as e:
             print(f"H:Error getting block devices: {e}")
             return False              
@@ -232,30 +248,57 @@ class BadgeBotApp(app.App):
             print(f"H:Mounting {partition} at {mountpoint}")
             try:
                 vfs.mount(partition, mountpoint, readonly=False)
-            except Exception as e:
+            except OSError as e:
                 if e.args[0] == 1:
                     already_mounted = True
                 else:
                     print(f"H:Error mounting: {e}")
+            except Exception as e:
+                print(f"H:Error mounting: {e}")
+        source_path = f"/" + __file__.rsplit("/", 1)[0] + f"/hexdrive.mpy"
+        dest_path   = f"{mountpoint}/app.mpy"
         try:
-            path = "/" + __file__.rsplit("/", 1)[0] + "/hexdrive.py"
-            print(f"H:Copying {path} to {mountpoint}/app.py")
-            with open(f"{mountpoint}/app.py", "wt") as appfile:
-                with open(path, "rt") as template:
-                    appfile.write(template.read())
+            # delete the existing app.mpy file
+            print(f"H:Deleting {dest_path}")
+            os.remove(f"{mountpoint}/app.py")
+            os.remove(dest_path)
         except Exception as e:
-            print(f"H:Error updating HexDrive app.py: {e}")
+            # ignore errors which will happen if the file does not exist
+            pass
+        print(f"H:Copying {source_path} to {dest_path}")
+        try:
+            appfile = open(dest_path, "wb")
+        except Exception as e:
+            print(f"H:Error opening {dest_path}: {e}")
             return False   
+        try:        
+            template = open(source_path, "rb")
+        except Exception as e:
+            print(f"H:Error opening {source_path}: {e}")
+            return False   
+        try:    
+            appfile.write(template.read())                           
+        except Exception as e:
+            print(f"H:Error updating HexDrive: {e}")
+            return False   
+        try:
+            appfile.close()
+            template.close()     
+        except Exception as e:
+            print(f"H:Error closing files: {e}")
+            return False
         if not already_mounted:
-            print(f"H:Unmounting {mountpoint}")                    
             try:
                 vfs.umount(mountpoint)
+                print(f"H:Unmounted {mountpoint}")                    
             except Exception as e:
                 print(f"H:Error unmounting {mountpoint}: {e}")
                 return False 
-        print(f"H:HexDrive app.py updated to version {CURRENT_APP_VERSION}")            
+        print(f"H:HexDrive app.mpy updated to version {CURRENT_APP_VERSION}")            
         return True
     
+
+
 
     def prepare_eeprom(self, port, i2c) -> bool:
         print(f"H:Initialising EEPROM on port {port}")
@@ -274,24 +317,27 @@ class BadgeBotApp(app.App):
         #write_header(port, header, addr=addr, addr_len=addr_len, page_size=header.eeprom_page_size)
         try:
             i2c.writeto(EEPROM_ADDR, bytes([0, 0]) + header.to_bytes())
-        except OSError as e:
+        except Exception as e:
             print(f"H:Error writing header: {e}")
             return False
         #header = read_hexpansion_header(i2c, EEPROM_ADDR, set_read_addr=True, addr_len=2)
         try:
             i2c.writeto(EEPROM_ADDR, bytes([0,0]))  # Read header @ address 0                
             header_bytes = i2c.readfrom(EEPROM_ADDR, 32)
-        except OSError as e:
+        except Exception as e:
             print(f"H:Error reading header back: {e}")
-            return False
+            #return False
         try:
             header = HexpansionHeader.from_bytes(header_bytes)
         except RuntimeError as e:
             print(f"H:Error parsing header: {e}")
-            return False
+            #return False
+        except Exception as e:
+            print(f"H:Error parsing header: {e}")
+            #return False
         try:
             # Get block devices
-            eep, partition = get_hexpansion_block_devices(i2c, header, EEPROM_ADDR)
+            _, partition = get_hexpansion_block_devices(i2c, header, EEPROM_ADDR)
         except RuntimeError as e:
             print(f"H:Error getting block devices: {e}")
             return False           
@@ -604,7 +650,7 @@ class BadgeBotApp(app.App):
             countdown_val = (RUN_COUNTDOWN_MS - self.run_countdown_elapsed_ms) / 1000
             ctx.rgb(1,1,0).move_to(H_START, V_START+VERTICAL_OFFSET).text(str(countdown_val))
         elif self.current_state == STATE_RUN:
-            ctx.rgb(1,1,1).move_to(H_START, V_START).text("Running power")
+            ctx.rgb(1,1,1).move_to(H_START, V_START).text("Running...")
             ctx.rgb(1,0,0).move_to(H_START-30, V_START + 2*VERTICAL_OFFSET).text(str(self.current_power_duration))
         elif self.current_state == STATE_DONE:
             ctx.rgb(1,1,1).move_to(H_START, V_START + 0*VERTICAL_OFFSET).text("Complete!")
@@ -676,16 +722,30 @@ class Instruction:
         elif self._press_type == BUTTON_TYPES["RIGHT"]:
             return (0, power, power, 0)
 
+    def directional_duration(self):
+        if self._press_type == BUTTON_TYPES["UP"]:
+            return (USER_DRIVE_MS)
+        elif self._press_type == BUTTON_TYPES["DOWN"]:
+            return (USER_DRIVE_MS)
+        elif self._press_type == BUTTON_TYPES["LEFT"]:
+            return (USER_TURN_MS)
+        elif self._press_type == BUTTON_TYPES["RIGHT"]:
+            return (USER_TURN_MS)
+        
     def make_power_plan(self):
         # return collection of tuples of power and their duration
         ramp_up = [(self.directional_power_tuple(p), TICK_MS)
                    for p in range(0, MAX_POWER, POWER_STEP_PER_TICK)]
+        print(f"Ramp up:")
+        print(ramp_up)
         power_durations = ramp_up.copy()
-        user_power_duration = USER_DRIVE_MS * (self._duration-1)
+        user_power_duration = self.directional_duration() * (self._duration-1)
         power_durations.append((self.directional_power_tuple(MAX_POWER), user_power_duration))
         ramp_down = ramp_up.copy()
         ramp_down.reverse()
         power_durations.extend(ramp_down)
+        print(f"Power durations:")
+        print(power_durations)
         self.power_plan_iterator = iter(power_durations)
 
 def chain(*iterables):
