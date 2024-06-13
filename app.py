@@ -3,7 +3,8 @@ import time
 import os
 import vfs
 from app_components.notification import Notification
-from app_components.tokens import label_font_size
+from app_components.tokens import label_font_size, twentyfour_pt
+from app_components.dialog import YesNoDialog
 from events.input import BUTTON_TYPES, Button, Buttons
 from machine import I2C
 from system.eventbus import eventbus
@@ -19,12 +20,16 @@ from system.scheduler.events import (RequestForegroundPopEvent,
 from tildagonos import tildagonos
 
 import app
+import settings
+
+# Hard coded to talk to 16bit address EEPROM on address 0x50 - because we know that is what is on the HexDrive Hexpansion
+# makes it a lot more efficient than scanning the I2C bus for devices and working out what they are
 
 CURRENT_APP_VERSION = 2648 # Integer Version Number - checked against the EEPROM app.py version to determine if it needs updating
 
-# Motor Driver
+# Motor Driver - Defaults
 MAX_POWER = 65535
-POWER_STEP_PER_TICK = 5000
+POWER_STEP_PER_TICK = 7500
 
 # Screen positioning for text
 VERTICAL_OFFSET = label_font_size
@@ -32,9 +37,9 @@ H_START = -78
 V_START = -58
 
 # Timings
-TICK_MS = 20 # Smallest unit of change for power, in ms
-USER_DRIVE_MS = 100 # User specifed drive durations, in ms
-USER_TURN_MS  = 20 # User specifed turn durations, in ms
+TICK_MS       =  10 # Smallest unit of change for power, in ms
+USER_DRIVE_MS =  50 # User specifed drive durations, in ms
+USER_TURN_MS  =  20 # User specifed turn durations, in ms
 LONG_PRESS_MS = 750 # Time for long button press to register, in ms
 RUN_COUNTDOWN_MS = 3000 # Time after running program until drive starts, in ms
 
@@ -75,15 +80,22 @@ class BadgeBotApp(app.App):
         self.scroll_offset = 0
 
         self.run_countdown_elapsed_ms = 0
-
         self.instructions = []
         self.current_instruction = None
+        
+        self._settings = {}
+        self._settings['acceleration'] = POWER_STEP_PER_TICK
+        self._settings['max_power'] = MAX_POWER
+        self._settings['drive_step_ms'] = USER_DRIVE_MS
+        self._settings['turn_step_ms'] = USER_TURN_MS
+        self.update_settings()   
 
         self.current_power_duration = ((0,0,0,0), 0)
         self.power_plan_iter = iter([])
 
         self.notification = None
         self.error_message = []
+        self.we_have_focus = False
 
         # Hexpansion related
         self.hexdrive_seen = False
@@ -134,11 +146,13 @@ class BadgeBotApp(app.App):
 
     async def gain_focus(self, event: RequestForegroundPushEvent):
         if event.app is self:
+            self.we_have_focus = True
             eventbus.emit(PatternDisable())
             self.clear_leds()
 
     async def lose_focus(self, event: RequestForegroundPopEvent):
         if event.app is self:
+            self.we_have_focus = False
             eventbus.emit(PatternEnable())
 
     async def background_task(self):
@@ -153,6 +167,7 @@ class BadgeBotApp(app.App):
             await asyncio.sleep(0.01)
             last_time = cur_time
 
+
     def background_update(self, delta):
         if self.current_state == STATE_RUN:
             power = self.get_current_power_level(delta)
@@ -160,6 +175,7 @@ class BadgeBotApp(app.App):
                 self.current_state = STATE_DONE
             else:
                 self.hexdrive_app.set_pwm(power)
+
 
     def check_port_for_hexdrive(self, port):
         # avoiding use of read_hexpansion_header as this triggers a full i2c scan each time
@@ -184,6 +200,7 @@ class BadgeBotApp(app.App):
         if header.vid == HEXDRIVE_VID and header.pid == HEXDRIVE_PID:
             print(f"H:Found HexDrive on port {port}")
             self.ports_with_hexdrive.add(port)
+
 
     def get_app_version_in_eeprom(self, port, header, i2c, addr) -> int:
         try:
@@ -233,6 +250,7 @@ class BadgeBotApp(app.App):
                 print(f"H:Error unmounting {mountpoint}: {e}")
         print(f"H:HexDrive app.mpy version:{version}")
         return int(version)
+
 
     def update_app_in_eeprom(self, port, header, i2c, addr) -> bool:
         # Copy hexdreive.py to EEPROM as app.mpy
@@ -365,6 +383,24 @@ class BadgeBotApp(app.App):
             self.check_port_for_hexdrive(port)
 
 
+    def update_settings(self):
+        # use latest settings
+        print("Updating settings:")
+        settings.load()
+        self._settings['acceleration']  = settings.get("badgebot_acceleration",  POWER_STEP_PER_TICK)
+        self._settings['max_power']     = settings.get("badgebot_max_power",     MAX_POWER)
+        self._settings['drive_step_ms'] = settings.get("badgebot_drive_step_ms", USER_DRIVE_MS)
+        self._settings['turn_step_ms']  = settings.get("badgebot_turn_step_ms",  USER_TURN_MS)
+        if (self._settings['acceleration'] != POWER_STEP_PER_TICK):
+            print(f"Power step per tick: {self._settings['acceleration']}")
+        if (self._settings['max_power'] != MAX_POWER):
+            print(f"Max power: {self._settings['max_power']}")
+        if (self._settings['drive_step_ms'] != USER_DRIVE_MS):  
+            print(f"Drive step ms: {self._settings['drive_step_ms']}")
+        if (self._settings['turn_step_ms'] != USER_TURN_MS):
+            print(f"Turn step ms: {self._settings['turn_step_ms']}")    
+
+
     def update(self, delta):
         if self.notification:
             self.notification.update(delta)
@@ -494,7 +530,7 @@ class BadgeBotApp(app.App):
                     self.current_state = STATE_WARNING
 
 
-        if self.button_states.get(BUTTON_TYPES["CANCEL"]) and self.current_state in MINIMISE_VALID_STATES:
+        if self.button_states.get(BUTTON_TYPES["CANCEL"]) and self.current_state in MINIMISE_VALID_STATES and self.current_state != STATE_DONE:
             self.button_states.clear()
             self.minimise()
         elif self.current_state == STATE_MENU:
@@ -568,9 +604,15 @@ class BadgeBotApp(app.App):
             pass
                 
         elif self.current_state == STATE_DONE:
-            if self.button_states.get(BUTTON_TYPES["CONFIRM"]):
+            if self.button_states.get(BUTTON_TYPES["CANCEL"]):
                 self.hexdrive_app.set_power(False)
                 self.reset()
+                self.button_states.clear()
+            elif self.button_states.get(BUTTON_TYPES["CONFIRM"]):
+                self.hexdrive_app.set_power(False)
+                self.restart()    
+                self.button_states.clear()
+
 
     def _handle_instruction_press(self, press_type: Button):
         if self.last_press == press_type:
@@ -580,20 +622,24 @@ class BadgeBotApp(app.App):
             self.current_instruction = Instruction(press_type)
         self.last_press = press_type
 
-    def reset(self):
-        self.current_state = STATE_MENU
-        self.button_states.clear()
+
+    def restart(self):
+        self.current_state = STATE_COUNTDOWN
         self.last_press = BUTTON_TYPES["CANCEL"]
         self.long_press_delta = 0
+        self.is_scroll = False
+        self.run_countdown_elapsed_ms = 0       
 
+
+    def reset(self):
+        self.current_state = STATE_MENU
+        self.last_press = BUTTON_TYPES["CONFIRM"]
+        self.long_press_delta = 0
         self.is_scroll = False
         self.scroll_offset = 0
-
         self.run_countdown_elapsed_ms = 0
-
         self.instructions = []
         self.current_instruction = None
-
         self.current_power_duration = ((0,0,0,0), 0)
         self.power_plan_iter = iter([])
 
@@ -607,63 +653,61 @@ class BadgeBotApp(app.App):
         else:
             ctx.rgb(0,0,0.1).rectangle(-120,-120,240,240).fill()
 
-        if self.current_state == STATE_WARNING:
-            ctx.rgb(1,1,1).move_to(H_START, V_START + 0*VERTICAL_OFFSET + 20).text("Please buy")
-            ctx.rgb(1,1,0).move_to(H_START, V_START + 1*VERTICAL_OFFSET + 20).text("HexDrive")
-            ctx.rgb(1,1,1).move_to(H_START, V_START + 2*VERTICAL_OFFSET + 20).text("Hexpansion")
-            ctx.rgb(1,1,1).move_to(H_START, V_START + 3*VERTICAL_OFFSET + 20).text("from")
-            ctx.rgb(1,1,0).move_to(H_START, V_START + 4*VERTICAL_OFFSET + 20).text("RobotMad")
+        if   self.current_state == STATE_WARNING:
+            self.draw_message(ctx, ["BadgeBot requires","HexDrive hexpansion","from RobotMad","github.com/TeamRobotmad","/BadgeBot"], [(1,1,1),(1,1,0),(1,1,0),(1,1,1),(1,1,1)], label_font_size)
         elif self.current_state == STATE_REMOVED:
-            ctx.rgb(1,1,0).move_to(H_START, V_START + 0*VERTICAL_OFFSET + 20).text("HexDrive")
-            ctx.rgb(1,1,1).move_to(H_START, V_START + 1*VERTICAL_OFFSET + 20).text("removed")
-            ctx.rgb(1,1,1).move_to(H_START, V_START + 2*VERTICAL_OFFSET + 20).text("Please reinsert")            
-        elif self.current_state == STATE_DETECTED:  
-            ctx.rgb(1,1,1).move_to(H_START, V_START + 0*VERTICAL_OFFSET + 00).text("Hexpansion")
-            ctx.rgb(1,1,1).move_to(H_START, V_START + 1*VERTICAL_OFFSET + 00).text("Detected in")
-            ctx.rgb(0,0,1).move_to(H_START, V_START + 2*VERTICAL_OFFSET + 00).text(f"Slot {self.detected_port}")
-            ctx.rgb(1,1,1).move_to(H_START, V_START + 3*VERTICAL_OFFSET + 00).text("Init EEPROM")
-            ctx.rgb(1,1,1).move_to(H_START, V_START + 4*VERTICAL_OFFSET + 00).text("as HexDrive?")
-        elif self.current_state == STATE_UPGRADE:  
-            ctx.rgb(1,1,0).move_to(H_START, V_START + 0*VERTICAL_OFFSET + 00).text("HexDrive")
-            ctx.rgb(1,1,1).move_to(H_START, V_START + 1*VERTICAL_OFFSET + 00).text("Detected in")
-            ctx.rgb(0,0,1).move_to(H_START, V_START + 2*VERTICAL_OFFSET + 00).text(f"Slot {self.upgrade_port}")
-            ctx.rgb(1,1,1).move_to(H_START, V_START + 3*VERTICAL_OFFSET + 00).text("Program EEPROM")
-            ctx.rgb(1,1,1).move_to(H_START, V_START + 4*VERTICAL_OFFSET + 00).text("with new App?")            
+            self.draw_message(ctx, ["HexDrive","removed","Please reinsert"], [(1,1,0),(1,1,1),(1,1,1)], label_font_size)      
+        elif self.current_state == STATE_DETECTED:
+            self.draw_message(ctx, ["Hexpansion","detected in",f"Slot {self.detected_port}","Init EEPROM","as HexDrive?"], [(1,1,1),(1,1,1),(0,0,1),(1,1,1),(1,1,0)], label_font_size)
+        elif self.current_state == STATE_UPGRADE:
+            self.draw_message(ctx, ["HexDrive","detected in",f"Slot {self.upgrade_port}","Upgrade","HexDrive App?"], [(1,1,0),(1,1,1),(0,0,1),(1,1,1),(1,1,1)], label_font_size)             
         elif self.current_state == STATE_PROGRAMMING:
-            ctx.rgb(1,1,0).move_to(H_START, V_START + 0*VERTICAL_OFFSET + 20).text("HexDrive")
-            ctx.rgb(1,1,1).move_to(H_START, V_START + 1*VERTICAL_OFFSET + 20).text("Programming")
-            ctx.rgb(1,1,1).move_to(H_START, V_START + 2*VERTICAL_OFFSET + 20).text("EEPROM")
-            ctx.rgb(1,1,1).move_to(H_START, V_START + 3*VERTICAL_OFFSET + 20).text("...")             
+            self.draw_message(ctx, ["HexDrive:","Programming","EEPROM","Please wait..."], [(1,1,0),(1,1,1),(1,1,1),(1,1,1)], label_font_size)            
         elif self.current_state == STATE_MENU:
-            ctx.rgb(1,1,1).move_to(H_START, V_START + 0*VERTICAL_OFFSET + 00).text("To Program:")
-            ctx.rgb(1,1,0).move_to(H_START, V_START + 1*VERTICAL_OFFSET + 00).text("Press C")
-            ctx.rgb(1,1,1).move_to(H_START, V_START + 2*VERTICAL_OFFSET + 10).text("When finished:")
-            ctx.rgb(1,1,0).move_to(H_START, V_START + 3*VERTICAL_OFFSET + 10).text("Long press C")
+            self.draw_message(ctx, ["BadgeBot","To Program:","Press C","When finished:","Long press C"], [(1,1,0),(1,1,1),(1,1,1),(1,1,1),(1,1,1)], label_font_size)
         elif self.current_state == STATE_ERROR:
-            for i_num, instr in enumerate(self.error_message):
-                ctx.rgb(1,0,0).move_to(H_START, V_START + VERTICAL_OFFSET * i_num).text(str(instr))
+            self.draw_message(ctx, self.error_message, [(1,0,0)]*len(self.error_message), label_font_size)
         elif self.current_state == STATE_RECEIVE_INSTR:
             for i_num, instr in enumerate(["START"] + self.instructions + [self.current_instruction, "END"]):
                 ctx.rgb(1,1,0).move_to(H_START, V_START + VERTICAL_OFFSET * (self.scroll_offset + i_num)).text(str(instr))
         elif self.current_state == STATE_COUNTDOWN:
             ctx.rgb(1,1,1).move_to(H_START, V_START).text("Running in:")
-            countdown_val = (RUN_COUNTDOWN_MS - self.run_countdown_elapsed_ms) / 1000
-            ctx.rgb(1,1,0).move_to(H_START, V_START+VERTICAL_OFFSET).text(str(countdown_val))
+            countdown_val = (RUN_COUNTDOWN_MS - self.run_countdown_elapsed_ms) // 1000
+            self.draw_message(ctx, [str(countdown_val)], [(1,1,0)], twentyfour_pt)
+            #ctx.rgb(1,1,0).move_to(H_START, V_START+VERTICAL_OFFSET).text(str(countdown_val))
         elif self.current_state == STATE_RUN:
-            ctx.rgb(1,1,1).move_to(H_START, V_START).text("Running...")
-            ctx.rgb(1,0,0).move_to(H_START-30, V_START + 2*VERTICAL_OFFSET).text(str(self.current_power_duration))
+            #ctx.rgb(1,1,1).move_to(H_START, V_START).text("Running...")
+            # convert current_power_duration to string, dividing all four values down by 655 (to get a value from 0-100)
+            current_power, _ = self.current_power_duration
+            power_str = str(tuple([x//655 for x in current_power]))
+            #TODO - remember the directon to be shown: direction_str = str(self.current_instruction.press_type)
+            #ctx.rgb(1,0,0).move_to(H_START-30, V_START + 2*VERTICAL_OFFSET).text(power_str)
+            self.draw_message(ctx, ["Running...",power_str], [(1,1,1),(1,1,0)], label_font_size)
         elif self.current_state == STATE_DONE:
-            ctx.rgb(1,1,1).move_to(H_START, V_START + 0*VERTICAL_OFFSET).text("Complete!")
-            ctx.rgb(1,1,1).move_to(H_START, V_START + 1*VERTICAL_OFFSET).text("To restart:")
-            ctx.rgb(1,1,0).move_to(H_START, V_START + 2*VERTICAL_OFFSET).text("Press C")
+            self.draw_message(ctx, ["Program","Complete!","Replay:Press C","Restart:Press F"], [(0,1,0),(0,1,0),(1,1,0),(0,1,1)], label_font_size)
         if self.notification:
             self.notification.draw(ctx)
         ctx.restore()
 
 
+    def draw_message(self, ctx, message, colours, size):
+        ctx.font_size = size
+        num_lines = len(message)
+        for i_num, instr in enumerate(message):
+            text_line = str(instr)
+            width = ctx.text_width(text_line)
+            try:
+                colour = colours[i_num]
+            except IndexError:
+                colour = None
+            if colour == None:
+                colour = (1,1,1)
+            ctx.rgb(*colour).move_to(-width//2, ctx.font_size*(i_num-((num_lines-1)/2))).text(text_line)
+
+
     def get_current_power_level(self, delta) -> int:
         # takes in delta as ms since last call
-        # if delta was > 20... what to do
+        # if delta was > 10... what to do
         if delta >= TICK_MS:
             delta = TICK_MS-1
 
@@ -686,21 +730,27 @@ class BadgeBotApp(app.App):
 
     def finalize_instruction(self):
         if self.current_instruction is not None:
-            self.current_instruction.make_power_plan()
+            self.current_instruction.make_power_plan(self._settings)
             self.instructions.append(self.current_instruction)
             if len(self.instructions) >= 5:
                 self.scroll_offset -= 1
             self.current_instruction = None
 
+
     def clear_leds(self):
-        for i in range(12):
-            tildagonos.leds[i+1] = (0, 0, 0)
+        for i in range(1,13):
+            tildagonos.leds[i] = (0, 0, 0)
+            tildagonos.leds.write()
+
+
+
 
 class Instruction:
     def __init__(self, press_type: Button) -> None:
         self._press_type = press_type
         self._duration: int = 1
         self.power_plan_iterator = iter([])
+
 
     @property
     def press_type(self) -> Button:
@@ -722,31 +772,41 @@ class Instruction:
         elif self._press_type == BUTTON_TYPES["RIGHT"]:
             return (0, power, power, 0)
 
-    def directional_duration(self):
+    def directional_duration(self, mysettings):
         if self._press_type == BUTTON_TYPES["UP"]:
-            return (USER_DRIVE_MS)
+            return (mysettings['drive_step_ms'])
         elif self._press_type == BUTTON_TYPES["DOWN"]:
-            return (USER_DRIVE_MS)
+            return (mysettings['drive_step_ms'])            
         elif self._press_type == BUTTON_TYPES["LEFT"]:
-            return (USER_TURN_MS)
+            return (mysettings['turn_step_ms'])
         elif self._press_type == BUTTON_TYPES["RIGHT"]:
-            return (USER_TURN_MS)
+            return (mysettings['turn_step_ms'])
         
-    def make_power_plan(self):
+    def make_power_plan(self, mysettings):
         # return collection of tuples of power and their duration
-        ramp_up = [(self.directional_power_tuple(p), TICK_MS)
-                   for p in range(0, MAX_POWER, POWER_STEP_PER_TICK)]
-        print(f"Ramp up:")
-        print(ramp_up)
+        curr_power = 0
+        ramp_up = []
+        for i in range(1*(self._duration+3)):
+            ramp_up.append((self.directional_power_tuple(curr_power), TICK_MS))
+            curr_power += mysettings['acceleration']
+            if curr_power >= mysettings['max_power']:
+                ramp_up.append((self.directional_power_tuple(mysettings['max_power']), TICK_MS))
+                break
+    
+        user_power_duration = (self.directional_duration(mysettings) * self._duration)-(2*(i+1)*TICK_MS)
+        
+        print(f"Ramp up: {ramp_up}")
         power_durations = ramp_up.copy()
-        user_power_duration = self.directional_duration() * (self._duration-1)
-        power_durations.append((self.directional_power_tuple(MAX_POWER), user_power_duration))
+        if user_power_duration > 0:
+            power_durations.append((self.directional_power_tuple(mysettings['max_power']), user_power_duration))
         ramp_down = ramp_up.copy()
         ramp_down.reverse()
         power_durations.extend(ramp_down)
-        print(f"Power durations:")
+        print("Power durations:")
         print(power_durations)
         self.power_plan_iterator = iter(power_durations)
+
+
 
 def chain(*iterables):
     for iterable in iterables:
