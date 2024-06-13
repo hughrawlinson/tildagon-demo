@@ -3,7 +3,8 @@ import time
 import os
 import vfs
 from app_components.notification import Notification
-from app_components.tokens import label_font_size
+from app_components.tokens import label_font_size, twentyfour_pt
+from app_components.dialog import YesNoDialog
 from events.input import BUTTON_TYPES, Button, Buttons
 from machine import I2C
 from system.eventbus import eventbus
@@ -20,6 +21,9 @@ from tildagonos import tildagonos
 
 import app
 import settings
+
+# Hard coded to talk to 16bit address EEPROM on address 0x50 - because we know that is what is on the HexDrive Hexpansion
+# makes it a lot more efficient than scanning the I2C bus for devices and working out what they are
 
 CURRENT_APP_VERSION = 2648 # Integer Version Number - checked against the EEPROM app.py version to determine if it needs updating
 
@@ -163,14 +167,15 @@ class BadgeBotApp(app.App):
             await asyncio.sleep(0.01)
             last_time = cur_time
 
-    def background_update(self, delta):
 
+    def background_update(self, delta):
         if self.current_state == STATE_RUN:
             power = self.get_current_power_level(delta)
             if power is None:
                 self.current_state = STATE_DONE
             else:
                 self.hexdrive_app.set_pwm(power)
+
 
     def check_port_for_hexdrive(self, port):
         # avoiding use of read_hexpansion_header as this triggers a full i2c scan each time
@@ -195,6 +200,7 @@ class BadgeBotApp(app.App):
         if header.vid == HEXDRIVE_VID and header.pid == HEXDRIVE_PID:
             print(f"H:Found HexDrive on port {port}")
             self.ports_with_hexdrive.add(port)
+
 
     def get_app_version_in_eeprom(self, port, header, i2c, addr) -> int:
         try:
@@ -244,6 +250,7 @@ class BadgeBotApp(app.App):
                 print(f"H:Error unmounting {mountpoint}: {e}")
         print(f"H:HexDrive app.mpy version:{version}")
         return int(version)
+
 
     def update_app_in_eeprom(self, port, header, i2c, addr) -> bool:
         # Copy hexdreive.py to EEPROM as app.mpy
@@ -523,7 +530,7 @@ class BadgeBotApp(app.App):
                     self.current_state = STATE_WARNING
 
 
-        if self.button_states.get(BUTTON_TYPES["CANCEL"]) and self.current_state in MINIMISE_VALID_STATES:
+        if self.button_states.get(BUTTON_TYPES["CANCEL"]) and self.current_state in MINIMISE_VALID_STATES and self.current_state != STATE_DONE:
             self.button_states.clear()
             self.minimise()
         elif self.current_state == STATE_MENU:
@@ -597,9 +604,14 @@ class BadgeBotApp(app.App):
             pass
                 
         elif self.current_state == STATE_DONE:
-            if self.button_states.get(BUTTON_TYPES["CONFIRM"]):
+            if self.button_states.get(BUTTON_TYPES["CANCEL"]):
                 self.hexdrive_app.set_power(False)
                 self.reset()
+                self.button_states.clear()
+            elif self.button_states.get(BUTTON_TYPES["CONFIRM"]):
+                self.hexdrive_app.set_power(False)
+                self.restart()    
+                self.button_states.clear()
 
 
     def _handle_instruction_press(self, press_type: Button):
@@ -611,20 +623,23 @@ class BadgeBotApp(app.App):
         self.last_press = press_type
 
 
-    def reset(self):
-        self.current_state = STATE_MENU
-        self.button_states.clear()
+    def restart(self):
+        self.current_state = STATE_COUNTDOWN
         self.last_press = BUTTON_TYPES["CANCEL"]
         self.long_press_delta = 0
+        self.is_scroll = False
+        self.run_countdown_elapsed_ms = 0       
 
+
+    def reset(self):
+        self.current_state = STATE_MENU
+        self.last_press = BUTTON_TYPES["CONFIRM"]
+        self.long_press_delta = 0
         self.is_scroll = False
         self.scroll_offset = 0
-
         self.run_countdown_elapsed_ms = 0
-
         self.instructions = []
         self.current_instruction = None
-
         self.current_power_duration = ((0,0,0,0), 0)
         self.power_plan_iter = iter([])
 
@@ -657,31 +672,37 @@ class BadgeBotApp(app.App):
                 ctx.rgb(1,1,0).move_to(H_START, V_START + VERTICAL_OFFSET * (self.scroll_offset + i_num)).text(str(instr))
         elif self.current_state == STATE_COUNTDOWN:
             ctx.rgb(1,1,1).move_to(H_START, V_START).text("Running in:")
-            countdown_val = (RUN_COUNTDOWN_MS - self.run_countdown_elapsed_ms) / 1000
-            ctx.rgb(1,1,0).move_to(H_START, V_START+VERTICAL_OFFSET).text(str(countdown_val))
+            countdown_val = (RUN_COUNTDOWN_MS - self.run_countdown_elapsed_ms) // 1000
+            self.draw_message(ctx, [str(countdown_val)], [(1,1,0)], twentyfour_pt)
+            #ctx.rgb(1,1,0).move_to(H_START, V_START+VERTICAL_OFFSET).text(str(countdown_val))
         elif self.current_state == STATE_RUN:
-            ctx.rgb(1,1,1).move_to(H_START, V_START).text("Running...")
-            ctx.rgb(1,0,0).move_to(H_START-30, V_START + 2*VERTICAL_OFFSET).text(str(self.current_power_duration))
+            #ctx.rgb(1,1,1).move_to(H_START, V_START).text("Running...")
+            # convert current_power_duration to string, dividing all four values down by 655 (to get a value from 0-100)
+            current_power, _ = self.current_power_duration
+            power_str = str(tuple([x//655 for x in current_power]))
+            #TODO - remember the directon to be shown: direction_str = str(self.current_instruction.press_type)
+            #ctx.rgb(1,0,0).move_to(H_START-30, V_START + 2*VERTICAL_OFFSET).text(power_str)
+            self.draw_message(ctx, ["Running...",power_str], [(1,1,1),(1,1,0)], label_font_size)
         elif self.current_state == STATE_DONE:
-            self.draw_message(ctx, ["Program","Complete!","To restart:","Press C"], [(1,1,1),(1,1,1),(1,1,1),(1,1,1)], label_font_size)
+            self.draw_message(ctx, ["Program","Complete!","Replay:Press C","Restart:Press F"], [(0,1,0),(0,1,0),(1,1,0),(0,1,1)], label_font_size)
         if self.notification:
             self.notification.draw(ctx)
         ctx.restore()
 
 
     def draw_message(self, ctx, message, colours, size):
-            ctx.font_size = size
-            num_lines = len(message)
-            for i_num, instr in enumerate(message):
-                text_line = str(instr)
-                width = ctx.text_width(text_line)
-                try:
-                    colour = colours[i_num]
-                except IndexError:
-                    colour = None
-                if colour == None:
-                    colour = (1,1,1)
-                ctx.rgb(*colour).move_to(-width/2, ctx.font_size*(i_num - (num_lines/2))).text(text_line)
+        ctx.font_size = size
+        num_lines = len(message)
+        for i_num, instr in enumerate(message):
+            text_line = str(instr)
+            width = ctx.text_width(text_line)
+            try:
+                colour = colours[i_num]
+            except IndexError:
+                colour = None
+            if colour == None:
+                colour = (1,1,1)
+            ctx.rgb(*colour).move_to(-width//2, ctx.font_size*(i_num-((num_lines-1)/2))).text(text_line)
 
 
     def get_current_power_level(self, delta) -> int:
@@ -714,6 +735,7 @@ class BadgeBotApp(app.App):
             if len(self.instructions) >= 5:
                 self.scroll_offset -= 1
             self.current_instruction = None
+
 
     def clear_leds(self):
         for i in range(1,13):
