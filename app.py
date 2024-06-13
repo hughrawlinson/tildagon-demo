@@ -749,7 +749,7 @@ class Instruction:
                 ramp_up.append((self.directional_power_tuple(self.max_power), TICK_MS))
                 break
     
-        user_power_duration = (self.directional_duration() * self._duration)-(2*(i+1)*TICK_MS))
+        user_power_duration = (self.directional_duration() * self._duration)-(2*(i+1)*TICK_MS)
         
         print(f"Ramp up: {ramp_up}")
         power_durations = ramp_up.copy()
