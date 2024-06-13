@@ -19,12 +19,13 @@ from system.scheduler.events import (RequestForegroundPopEvent,
 from tildagonos import tildagonos
 
 import app
+import settings
 
 CURRENT_APP_VERSION = 2648 # Integer Version Number - checked against the EEPROM app.py version to determine if it needs updating
 
-# Motor Driver
+# Motor Driver - Defaults
 MAX_POWER = 65535
-POWER_STEP_PER_TICK = 5000
+POWER_STEP_PER_TICK = 7500
 
 # Screen positioning for text
 VERTICAL_OFFSET = label_font_size
@@ -32,9 +33,9 @@ H_START = -78
 V_START = -58
 
 # Timings
-TICK_MS = 20 # Smallest unit of change for power, in ms
-USER_DRIVE_MS = 100 # User specifed drive durations, in ms
-USER_TURN_MS  = 20 # User specifed turn durations, in ms
+TICK_MS       =  10 # Smallest unit of change for power, in ms
+USER_DRIVE_MS =  50 # User specifed drive durations, in ms
+USER_TURN_MS  =  20 # User specifed turn durations, in ms
 LONG_PRESS_MS = 750 # Time for long button press to register, in ms
 RUN_COUNTDOWN_MS = 3000 # Time after running program until drive starts, in ms
 
@@ -75,7 +76,6 @@ class BadgeBotApp(app.App):
         self.scroll_offset = 0
 
         self.run_countdown_elapsed_ms = 0
-
         self.instructions = []
         self.current_instruction = None
 
@@ -84,6 +84,7 @@ class BadgeBotApp(app.App):
 
         self.notification = None
         self.error_message = []
+        self.we_have_focus = False
 
         # Hexpansion related
         self.hexdrive_seen = False
@@ -134,11 +135,13 @@ class BadgeBotApp(app.App):
 
     async def gain_focus(self, event: RequestForegroundPushEvent):
         if event.app is self:
+            self.we_have_focus = True
             eventbus.emit(PatternDisable())
             self.clear_leds()
 
     async def lose_focus(self, event: RequestForegroundPopEvent):
         if event.app is self:
+            self.we_have_focus = False
             eventbus.emit(PatternEnable())
 
     async def background_task(self):
@@ -154,6 +157,7 @@ class BadgeBotApp(app.App):
             last_time = cur_time
 
     def background_update(self, delta):
+
         if self.current_state == STATE_RUN:
             power = self.get_current_power_level(delta)
             if power is None:
@@ -572,6 +576,7 @@ class BadgeBotApp(app.App):
                 self.hexdrive_app.set_power(False)
                 self.reset()
 
+
     def _handle_instruction_press(self, press_type: Button):
         if self.last_press == press_type:
             self.current_instruction.inc()
@@ -579,6 +584,7 @@ class BadgeBotApp(app.App):
             self.finalize_instruction()
             self.current_instruction = Instruction(press_type)
         self.last_press = press_type
+
 
     def reset(self):
         self.current_state = STATE_MENU
@@ -607,41 +613,20 @@ class BadgeBotApp(app.App):
         else:
             ctx.rgb(0,0,0.1).rectangle(-120,-120,240,240).fill()
 
-        if self.current_state == STATE_WARNING:
-            ctx.rgb(1,1,1).move_to(H_START, V_START + 0*VERTICAL_OFFSET + 20).text("Please buy")
-            ctx.rgb(1,1,0).move_to(H_START, V_START + 1*VERTICAL_OFFSET + 20).text("HexDrive")
-            ctx.rgb(1,1,1).move_to(H_START, V_START + 2*VERTICAL_OFFSET + 20).text("Hexpansion")
-            ctx.rgb(1,1,1).move_to(H_START, V_START + 3*VERTICAL_OFFSET + 20).text("from")
-            ctx.rgb(1,1,0).move_to(H_START, V_START + 4*VERTICAL_OFFSET + 20).text("RobotMad")
+        if   self.current_state == STATE_WARNING:
+            self.draw_message(ctx, ["BadgeBot requires","HexDrive hexpansion","from RobotMad","github.com/TeamRobotmad","/BadgeBot"], [(1,1,1),(1,1,0),(1,1,0),(1,1,1),(1,1,1)], label_font_size)
         elif self.current_state == STATE_REMOVED:
-            ctx.rgb(1,1,0).move_to(H_START, V_START + 0*VERTICAL_OFFSET + 20).text("HexDrive")
-            ctx.rgb(1,1,1).move_to(H_START, V_START + 1*VERTICAL_OFFSET + 20).text("removed")
-            ctx.rgb(1,1,1).move_to(H_START, V_START + 2*VERTICAL_OFFSET + 20).text("Please reinsert")            
-        elif self.current_state == STATE_DETECTED:  
-            ctx.rgb(1,1,1).move_to(H_START, V_START + 0*VERTICAL_OFFSET + 00).text("Hexpansion")
-            ctx.rgb(1,1,1).move_to(H_START, V_START + 1*VERTICAL_OFFSET + 00).text("Detected in")
-            ctx.rgb(0,0,1).move_to(H_START, V_START + 2*VERTICAL_OFFSET + 00).text(f"Slot {self.detected_port}")
-            ctx.rgb(1,1,1).move_to(H_START, V_START + 3*VERTICAL_OFFSET + 00).text("Init EEPROM")
-            ctx.rgb(1,1,1).move_to(H_START, V_START + 4*VERTICAL_OFFSET + 00).text("as HexDrive?")
-        elif self.current_state == STATE_UPGRADE:  
-            ctx.rgb(1,1,0).move_to(H_START, V_START + 0*VERTICAL_OFFSET + 00).text("HexDrive")
-            ctx.rgb(1,1,1).move_to(H_START, V_START + 1*VERTICAL_OFFSET + 00).text("Detected in")
-            ctx.rgb(0,0,1).move_to(H_START, V_START + 2*VERTICAL_OFFSET + 00).text(f"Slot {self.upgrade_port}")
-            ctx.rgb(1,1,1).move_to(H_START, V_START + 3*VERTICAL_OFFSET + 00).text("Program EEPROM")
-            ctx.rgb(1,1,1).move_to(H_START, V_START + 4*VERTICAL_OFFSET + 00).text("with new App?")            
+            self.draw_message(ctx, ["HexDrive","removed","Please reinsert"], [(1,1,0),(1,1,1),(1,1,1)], label_font_size)      
+        elif self.current_state == STATE_DETECTED:
+            self.draw_message(ctx, ["Hexpansion","detected in",f"Slot {self.detected_port}","Init EEPROM","as HexDrive?"], [(1,1,1),(1,1,1),(0,0,1),(1,1,1),(1,1,0)], label_font_size)
+        elif self.current_state == STATE_UPGRADE:
+            self.draw_message(ctx, ["HexDrive","detected in",f"Slot {self.upgrade_port}","Upgrade","HexDrive App?"], [(1,1,0),(1,1,1),(0,0,1),(1,1,1),(1,1,1)], label_font_size)             
         elif self.current_state == STATE_PROGRAMMING:
-            ctx.rgb(1,1,0).move_to(H_START, V_START + 0*VERTICAL_OFFSET + 20).text("HexDrive")
-            ctx.rgb(1,1,1).move_to(H_START, V_START + 1*VERTICAL_OFFSET + 20).text("Programming")
-            ctx.rgb(1,1,1).move_to(H_START, V_START + 2*VERTICAL_OFFSET + 20).text("EEPROM")
-            ctx.rgb(1,1,1).move_to(H_START, V_START + 3*VERTICAL_OFFSET + 20).text("...")             
+            self.draw_message(ctx, ["HexDrive:","Programming","EEPROM","Please wait..."], [(1,1,0),(1,1,1),(1,1,1),(1,1,1)], label_font_size)            
         elif self.current_state == STATE_MENU:
-            ctx.rgb(1,1,1).move_to(H_START, V_START + 0*VERTICAL_OFFSET + 00).text("To Program:")
-            ctx.rgb(1,1,0).move_to(H_START, V_START + 1*VERTICAL_OFFSET + 00).text("Press C")
-            ctx.rgb(1,1,1).move_to(H_START, V_START + 2*VERTICAL_OFFSET + 10).text("When finished:")
-            ctx.rgb(1,1,0).move_to(H_START, V_START + 3*VERTICAL_OFFSET + 10).text("Long press C")
+            self.draw_message(ctx, ["BadgeBot","To Program:","Press C","When finished:","Long press C"], [(1,1,0),(1,1,1),(1,1,1),(1,1,1),(1,1,1)], label_font_size)
         elif self.current_state == STATE_ERROR:
-            for i_num, instr in enumerate(self.error_message):
-                ctx.rgb(1,0,0).move_to(H_START, V_START + VERTICAL_OFFSET * i_num).text(str(instr))
+            self.draw_message(ctx, self.error_message, [(1,0,0)]*len(self.error_message), label_font_size)
         elif self.current_state == STATE_RECEIVE_INSTR:
             for i_num, instr in enumerate(["START"] + self.instructions + [self.current_instruction, "END"]):
                 ctx.rgb(1,1,0).move_to(H_START, V_START + VERTICAL_OFFSET * (self.scroll_offset + i_num)).text(str(instr))
@@ -653,17 +638,30 @@ class BadgeBotApp(app.App):
             ctx.rgb(1,1,1).move_to(H_START, V_START).text("Running...")
             ctx.rgb(1,0,0).move_to(H_START-30, V_START + 2*VERTICAL_OFFSET).text(str(self.current_power_duration))
         elif self.current_state == STATE_DONE:
-            ctx.rgb(1,1,1).move_to(H_START, V_START + 0*VERTICAL_OFFSET).text("Complete!")
-            ctx.rgb(1,1,1).move_to(H_START, V_START + 1*VERTICAL_OFFSET).text("To restart:")
-            ctx.rgb(1,1,0).move_to(H_START, V_START + 2*VERTICAL_OFFSET).text("Press C")
+            self.draw_message(ctx, ["Program","Complete!","To restart:","Press C"], [(1,1,1),(1,1,1),(1,1,1),(1,1,1)], label_font_size)
         if self.notification:
             self.notification.draw(ctx)
         ctx.restore()
 
 
+    def draw_message(self, ctx, message, colours, size):
+            ctx.font_size = size
+            num_lines = len(message)
+            for i_num, instr in enumerate(message):
+                text_line = str(instr)
+                width = ctx.text_width(text_line)
+                try:
+                    colour = colours[i_num]
+                except IndexError:
+                    colour = None
+                if colour == None:
+                    colour = (1,1,1)
+                ctx.rgb(*colour).move_to(-width/2, ctx.font_size*(i_num - (num_lines/2))).text(text_line)
+
+
     def get_current_power_level(self, delta) -> int:
         # takes in delta as ms since last call
-        # if delta was > 20... what to do
+        # if delta was > 10... what to do
         if delta >= TICK_MS:
             delta = TICK_MS-1
 
@@ -686,6 +684,7 @@ class BadgeBotApp(app.App):
 
     def finalize_instruction(self):
         if self.current_instruction is not None:
+            self.current_instruction.update_settings()   
             self.current_instruction.make_power_plan()
             self.instructions.append(self.current_instruction)
             if len(self.instructions) >= 5:
@@ -693,14 +692,21 @@ class BadgeBotApp(app.App):
             self.current_instruction = None
 
     def clear_leds(self):
-        for i in range(12):
-            tildagonos.leds[i+1] = (0, 0, 0)
+        for i in range(1,13):
+            tildagonos.leds[i] = (0, 0, 0)
+            tildagonos.leds.write()
+
 
 class Instruction:
     def __init__(self, press_type: Button) -> None:
         self._press_type = press_type
         self._duration: int = 1
         self.power_plan_iterator = iter([])
+        # need to move these as don't need a copy in each instance
+        self.max_power = MAX_POWER
+        self.power_step_per_tick = POWER_STEP_PER_TICK
+        self.drive_step_ms = USER_DRIVE_MS
+        self.turn_step_ms = USER_TURN_MS
 
     @property
     def press_type(self) -> Button:
@@ -724,37 +730,52 @@ class Instruction:
 
     def directional_duration(self):
         if self._press_type == BUTTON_TYPES["UP"]:
-            return (USER_DRIVE_MS)
+            return (self.drive_step_ms)
         elif self._press_type == BUTTON_TYPES["DOWN"]:
-            return (USER_DRIVE_MS)
+            return (self.drive_step_ms)
         elif self._press_type == BUTTON_TYPES["LEFT"]:
-            return (USER_TURN_MS)
+            return (self.turn_step_ms)
         elif self._press_type == BUTTON_TYPES["RIGHT"]:
-            return (USER_TURN_MS)
+            return (self.turn_step_ms)
         
     def make_power_plan(self):
         # return collection of tuples of power and their duration
         curr_power = 0
         ramp_up = []
-        for i in range(self._duration):
-            ramp_up.append(self.directional_power_tuple(curr_power), TICK_MS)
-            curr_power += POWER_STEP_PER_TICK
-            if curr_power >= MAX_POWER:
-                ramp_up.append(self.directional_power_tuple(MAX_POWER), TICK_MS)
+        for i in range(1*(self._duration+3)):
+            ramp_up.append((self.directional_power_tuple(curr_power), TICK_MS))
+            curr_power += self.power_step_per_tick                    
+            if curr_power >= self.max_power:
+                ramp_up.append((self.directional_power_tuple(self.max_power), TICK_MS))
                 break
-        
-        user_power_duration = self.directional_duration() * (self._duration-(i+1))
+    
+        user_power_duration = (self.directional_duration() * self._duration)-(2*(i+1)*TICK_MS))
         
         print(f"Ramp up: {ramp_up}")
         power_durations = ramp_up.copy()
         if user_power_duration > 0:
-            power_durations.append((self.directional_power_tuple(MAX_POWER), user_power_duration))
+            power_durations.append((self.directional_power_tuple(self.max_power), user_power_duration))
         ramp_down = ramp_up.copy()
         ramp_down.reverse()
         power_durations.extend(ramp_down)
         print("Power durations:")
         print(power_durations)
         self.power_plan_iterator = iter(power_durations)
+
+    def update_settings(self):
+        # use latest settings
+        self.power_step_per_tick = settings.get("badgebot_acceleration",  POWER_STEP_PER_TICK)
+        self.max_power           = settings.get("badgebot_max_power",     MAX_POWER)
+        self.drive_step_ms       = settings.get("badgebot_drive_step_ms", USER_DRIVE_MS)
+        self.turn_step_ms        = settings.get("badgebot_turn_step_ms",  USER_TURN_MS)
+        if (self.power_step_per_tick != POWER_STEP_PER_TICK):
+            print(f"Power step per tick: {self.power_step_per_tick}")
+        if (self.max_power != MAX_POWER):
+            print(f"Max power: {self.max_power}")
+        if (self.drive_step_ms != USER_DRIVE_MS):
+            print(f"Drive step ms: {self.drive_step_ms}")
+        if (self.turn_step_ms != USER_TURN_MS):
+            print(f"Turn step ms: {self.turn_step_ms}")
 
 def chain(*iterables):
     for iterable in iterables:
