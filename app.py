@@ -78,6 +78,13 @@ class BadgeBotApp(app.App):
         self.run_countdown_elapsed_ms = 0
         self.instructions = []
         self.current_instruction = None
+        
+        self._settings = {}
+        self._settings['acceleration'] = POWER_STEP_PER_TICK
+        self._settings['max_power'] = MAX_POWER
+        self._settings['drive_step_ms'] = USER_DRIVE_MS
+        self._settings['turn_step_ms'] = USER_TURN_MS
+        self.update_settings()   
 
         self.current_power_duration = ((0,0,0,0), 0)
         self.power_plan_iter = iter([])
@@ -367,6 +374,24 @@ class BadgeBotApp(app.App):
     def scan_ports(self):
         for port in range(1, 7):
             self.check_port_for_hexdrive(port)
+
+
+    def update_settings(self):
+        # use latest settings
+        print("Updating settings:")
+        settings.load()
+        self._settings['acceleration']  = settings.get("badgebot_acceleration",  POWER_STEP_PER_TICK)
+        self._settings['max_power']     = settings.get("badgebot_max_power",     MAX_POWER)
+        self._settings['drive_step_ms'] = settings.get("badgebot_drive_step_ms", USER_DRIVE_MS)
+        self._settings['turn_step_ms']  = settings.get("badgebot_turn_step_ms",  USER_TURN_MS)
+        if (self._settings['acceleration'] != POWER_STEP_PER_TICK):
+            print(f"Power step per tick: {self._settings['acceleration']}")
+        if (self._settings['max_power'] != MAX_POWER):
+            print(f"Max power: {self._settings['max_power']}")
+        if (self._settings['drive_step_ms'] != USER_DRIVE_MS):  
+            print(f"Drive step ms: {self._settings['drive_step_ms']}")
+        if (self._settings['turn_step_ms'] != USER_TURN_MS):
+            print(f"Turn step ms: {self._settings['turn_step_ms']}")    
 
 
     def update(self, delta):
@@ -684,8 +709,7 @@ class BadgeBotApp(app.App):
 
     def finalize_instruction(self):
         if self.current_instruction is not None:
-            self.current_instruction.update_settings()   
-            self.current_instruction.make_power_plan()
+            self.current_instruction.make_power_plan(self._settings)
             self.instructions.append(self.current_instruction)
             if len(self.instructions) >= 5:
                 self.scroll_offset -= 1
@@ -697,16 +721,14 @@ class BadgeBotApp(app.App):
             tildagonos.leds.write()
 
 
+
+
 class Instruction:
     def __init__(self, press_type: Button) -> None:
         self._press_type = press_type
         self._duration: int = 1
         self.power_plan_iterator = iter([])
-        # need to move these as don't need a copy in each instance
-        self.max_power = MAX_POWER
-        self.power_step_per_tick = POWER_STEP_PER_TICK
-        self.drive_step_ms = USER_DRIVE_MS
-        self.turn_step_ms = USER_TURN_MS
+
 
     @property
     def press_type(self) -> Button:
@@ -728,33 +750,33 @@ class Instruction:
         elif self._press_type == BUTTON_TYPES["RIGHT"]:
             return (0, power, power, 0)
 
-    def directional_duration(self):
+    def directional_duration(self, mysettings):
         if self._press_type == BUTTON_TYPES["UP"]:
-            return (self.drive_step_ms)
+            return (mysettings['drive_step_ms'])
         elif self._press_type == BUTTON_TYPES["DOWN"]:
-            return (self.drive_step_ms)
+            return (mysettings['drive_step_ms'])            
         elif self._press_type == BUTTON_TYPES["LEFT"]:
-            return (self.turn_step_ms)
+            return (mysettings['turn_step_ms'])
         elif self._press_type == BUTTON_TYPES["RIGHT"]:
-            return (self.turn_step_ms)
+            return (mysettings['turn_step_ms'])
         
-    def make_power_plan(self):
+    def make_power_plan(self, mysettings):
         # return collection of tuples of power and their duration
         curr_power = 0
         ramp_up = []
         for i in range(1*(self._duration+3)):
             ramp_up.append((self.directional_power_tuple(curr_power), TICK_MS))
-            curr_power += self.power_step_per_tick                    
-            if curr_power >= self.max_power:
-                ramp_up.append((self.directional_power_tuple(self.max_power), TICK_MS))
+            curr_power += mysettings['acceleration']
+            if curr_power >= mysettings['max_power']:
+                ramp_up.append((self.directional_power_tuple(mysettings['max_power']), TICK_MS))
                 break
     
-        user_power_duration = (self.directional_duration() * self._duration)-(2*(i+1)*TICK_MS)
+        user_power_duration = (self.directional_duration(mysettings) * self._duration)-(2*(i+1)*TICK_MS)
         
         print(f"Ramp up: {ramp_up}")
         power_durations = ramp_up.copy()
         if user_power_duration > 0:
-            power_durations.append((self.directional_power_tuple(self.max_power), user_power_duration))
+            power_durations.append((self.directional_power_tuple(mysettings['max_power']), user_power_duration))
         ramp_down = ramp_up.copy()
         ramp_down.reverse()
         power_durations.extend(ramp_down)
@@ -762,20 +784,7 @@ class Instruction:
         print(power_durations)
         self.power_plan_iterator = iter(power_durations)
 
-    def update_settings(self):
-        # use latest settings
-        self.power_step_per_tick = settings.get("badgebot_acceleration",  POWER_STEP_PER_TICK)
-        self.max_power           = settings.get("badgebot_max_power",     MAX_POWER)
-        self.drive_step_ms       = settings.get("badgebot_drive_step_ms", USER_DRIVE_MS)
-        self.turn_step_ms        = settings.get("badgebot_turn_step_ms",  USER_TURN_MS)
-        if (self.power_step_per_tick != POWER_STEP_PER_TICK):
-            print(f"Power step per tick: {self.power_step_per_tick}")
-        if (self.max_power != MAX_POWER):
-            print(f"Max power: {self.max_power}")
-        if (self.drive_step_ms != USER_DRIVE_MS):
-            print(f"Drive step ms: {self.drive_step_ms}")
-        if (self.turn_step_ms != USER_TURN_MS):
-            print(f"Turn step ms: {self.turn_step_ms}")
+
 
 def chain(*iterables):
     for iterable in iterables:
