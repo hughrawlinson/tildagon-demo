@@ -3,7 +3,7 @@
 name = "Demo App"
 
 # The submenu where your app should appear.
-# One of: "Badge", "Music", "Media", "Apps", "Games"
+# One of: "Badge", "Music", "Media", "Apps", "Games", "Background"
 category = "Badge"
 
 # OPTIONAL: Same as above, for compatibility with older firmware
